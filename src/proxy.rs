@@ -16,11 +16,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                     Ok(())
                 }
                 Ok(Err(e)) => {
-                    eprintln!("[btk] stdin task error: {e}");
                     Err(e)
                 }
                 Err(e) => {
-                    eprintln!("[btk] stdin task panicked: {e}");
                     Err(anyhow::anyhow!("stdin task panicked: {e}"))
                 }
             }
@@ -32,11 +30,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                     Err(anyhow::anyhow!("SSE task finished unexpectedly"))
                 }
                 Ok(Err(e)) => {
-                    eprintln!("[btk] SSE task error: {e}");
                     Err(e)
                 }
                 Err(e) => {
-                    eprintln!("[btk] SSE task panicked: {e}");
                     Err(anyhow::anyhow!("SSE task panicked: {e}"))
                 }
             }
