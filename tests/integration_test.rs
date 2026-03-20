@@ -56,7 +56,7 @@ async fn test_tools_list_passthrough() {
                 // Check each line accumulated so far (strip \r so CRLF works too)
                 for raw_line in preamble.lines() {
                     let line = raw_line.trim_end_matches('\r');
-                    if let Some(val) = line.strip_prefix("data: ?sessionId=") {
+                    if let Some(val) = line.strip_prefix("data: ") {
                         session_id = Some(val.trim_end_matches('\r').to_string());
                         return; // found what we need
                     }
@@ -81,7 +81,7 @@ async fn test_tools_list_passthrough() {
         "method": "tools/list",
         "params": {}
     });
-    let post_url = format!("{burp_url}/?sessionId={session_id}");
+    let post_url = format!("{burp_url}{session_id}");  // session_id is already "?sessionId=..."
     let post_resp = client
         .post(&post_url)
         .header("Content-Type", "application/json")
