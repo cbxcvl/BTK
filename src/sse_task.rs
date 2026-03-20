@@ -98,17 +98,24 @@ async fn stream_sse(
                     Some("message") | None => {
                         // "message" is the explicit type, None means no event: line (default)
                         let output = if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) {
-                            // Layer 1: lossless strip (always)
-                            crate::lossless::strip(&mut value);
-
                             // tools/list response: compress descriptions + inject synthetic tools
                             if value.pointer("/result/tools").and_then(|t| t.as_array()).is_some() {
+                                // Layer 1: lossless strip (tools/list branch)
+                                crate::lossless::strip(&mut value);
                                 crate::compressor::transform(&mut value, compressor_config);
                                 crate::synthetic::inject_tools(&mut value);
                             } else {
                                 // Look up originating tool name from inflight map
                                 let tool_name = value["id"].as_u64()
                                     .and_then(|id| inflight.remove(&id).map(|(_, v)| v));
+
+                                // Normalize Burp's content[0].text → result.items (must precede lossless)
+                                if let Some(ref tname) = tool_name {
+                                    crate::normalizer::normalize_response(&mut value, tname);
+                                }
+
+                                // Layer 1: lossless strip (now result.items exists if normalization ran)
+                                crate::lossless::strip(&mut value);
 
                                 let grouped = if let Some(ref tname) = tool_name {
                                     if crate::grouper::is_groupable(tname) {
