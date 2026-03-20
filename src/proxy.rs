@@ -5,8 +5,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let config = Arc::new(config);
     let client = Arc::new(reqwest::Client::new());
 
-    let stdin_handle = tokio::spawn(crate::stdin_task::run(client.clone(), config.clone()));
-    let sse_handle = tokio::spawn(crate::sse_task::run(client.clone(), config.clone()));
+    let (session_tx, session_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+
+    let stdin_handle = tokio::spawn(crate::stdin_task::run(client.clone(), config.clone(), session_rx));
+    let sse_handle = tokio::spawn(crate::sse_task::run(client.clone(), config.clone(), session_tx));
 
     tokio::select! {
         res = stdin_handle => {

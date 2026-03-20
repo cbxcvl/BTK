@@ -9,12 +9,16 @@ pub(crate) fn backoff_secs(consecutive_failures: u32, max_secs: u64) -> u64 {
     exp.min(max_secs)
 }
 
-pub async fn run(client: Arc<reqwest::Client>, config: Arc<Config>) -> anyhow::Result<()> {
+pub async fn run(
+    client: Arc<reqwest::Client>,
+    config: Arc<Config>,
+    session_tx: tokio::sync::watch::Sender<Option<String>>,
+) -> anyhow::Result<()> {
     const MAX_FAILURES: u32 = 5;
     let mut failures = 0u32;
 
     loop {
-        match stream_sse(&client, &config).await {
+        match stream_sse(&client, &config, &session_tx).await {
             Ok(()) => {
                 // Stream ended cleanly (server closed connection) — reconnect immediately
                 failures = 0;
@@ -34,8 +38,12 @@ pub async fn run(client: Arc<reqwest::Client>, config: Arc<Config>) -> anyhow::R
     }
 }
 
-async fn stream_sse(client: &reqwest::Client, config: &Config) -> anyhow::Result<()> {
-    let url = format!("{}/sse", config.burp_url);
+async fn stream_sse(
+    client: &reqwest::Client,
+    config: &Config,
+    session_tx: &tokio::sync::watch::Sender<Option<String>>,
+) -> anyhow::Result<()> {
+    let url = format!("{}/", config.burp_url);
     let response = client
         .get(&url)
         .header("Accept", "text/event-stream")
@@ -54,15 +62,25 @@ async fn stream_sse(client: &reqwest::Client, config: &Config) -> anyhow::Result
         let chunk = chunk?;
         buf.push_str(&String::from_utf8_lossy(&chunk));
 
-        // Process all complete lines in the buffer
-        while let Some(pos) = buf.find('\n') {
-            let line = buf[..pos].trim_end_matches('\r').to_string();
-            buf = buf[pos + 1..].to_string();
+        // Process all complete events in the buffer (events separated by \n\n)
+        while let Some(pos) = buf.find("\n\n") {
+            let event_block = buf[..pos].to_string();
+            buf = buf[pos + 2..].to_string();
 
-            if let Some(data) = parse_sse_data(&line) {
-                stdout.write_all(data.as_bytes()).await?;
-                stdout.write_all(b"\n").await?;
-                stdout.flush().await?;
+            if let Some((event_type, data)) = parse_event(&event_block) {
+                match event_type {
+                    "endpoint" => {
+                        let session_url = format!("{}{}", config.burp_url, data);
+                        eprintln!("[btk] Got session URL: {session_url}");
+                        let _ = session_tx.send(Some(session_url));
+                    }
+                    "message" => {
+                        stdout.write_all(data.as_bytes()).await?;
+                        stdout.write_all(b"\n").await?;
+                        stdout.flush().await?;
+                    }
+                    _ => {} // ignore other event types
+                }
             }
         }
     }
@@ -70,6 +88,20 @@ async fn stream_sse(client: &reqwest::Client, config: &Config) -> anyhow::Result
     Ok(())
 }
 
+pub(crate) fn parse_event(event_block: &str) -> Option<(&str, &str)> {
+    let mut event_type = None;
+    let mut data = None;
+    for line in event_block.lines() {
+        if let Some(t) = line.strip_prefix("event: ") {
+            event_type = Some(t);
+        } else if let Some(d) = line.strip_prefix("data: ") {
+            data = Some(d);
+        }
+    }
+    event_type.zip(data)
+}
+
+#[allow(dead_code)]
 pub(crate) fn parse_sse_data(line: &str) -> Option<String> {
     line.strip_prefix("data: ").map(|s| s.to_string())
 }
@@ -77,6 +109,36 @@ pub(crate) fn parse_sse_data(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_event_message() {
+        let block = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1}";
+        assert_eq!(parse_event(block), Some(("message", "{\"jsonrpc\":\"2.0\",\"id\":1}")));
+    }
+
+    #[test]
+    fn parse_event_endpoint() {
+        let block = "event: endpoint\ndata: ?sessionId=abc123";
+        assert_eq!(parse_event(block), Some(("endpoint", "?sessionId=abc123")));
+    }
+
+    #[test]
+    fn parse_event_missing_data_returns_none() {
+        let block = "event: message";
+        assert_eq!(parse_event(block), None);
+    }
+
+    #[test]
+    fn parse_event_missing_event_returns_none() {
+        let block = "data: {\"jsonrpc\":\"2.0\"}";
+        assert_eq!(parse_event(block), None);
+    }
+
+    #[test]
+    fn parse_event_unknown_type() {
+        let block = "event: ping\ndata: {}";
+        assert_eq!(parse_event(block), Some(("ping", "{}")));
+    }
 
     #[test]
     fn extracts_data_field() {

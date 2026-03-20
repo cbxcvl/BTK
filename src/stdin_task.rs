@@ -2,25 +2,40 @@ use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
 use crate::config::Config;
 
-fn mcp_url(base: &str) -> String {
-    format!("{}/mcp", base)
-}
-
 fn is_empty_line(line: &str) -> bool {
     line.trim().is_empty()
 }
 
-pub async fn run(client: Arc<reqwest::Client>, config: Arc<Config>) -> anyhow::Result<()> {
+pub async fn run(
+    client: Arc<reqwest::Client>,
+    _config: Arc<Config>,
+    mut session_rx: tokio::sync::watch::Receiver<Option<String>>,
+) -> anyhow::Result<()> {
+    // Wait for the session URL from the SSE handshake before processing stdin
+    let session_url = loop {
+        {
+            let url = session_rx.borrow();
+            if url.is_some() {
+                break url.clone().unwrap();
+            }
+        }
+        session_rx
+            .changed()
+            .await
+            .map_err(|_| anyhow::anyhow!("session channel closed before handshake"))?;
+    };
+
+    eprintln!("[btk] Session URL ready, forwarding stdin to {session_url}");
+
     let stdin = tokio::io::stdin();
     let mut lines = tokio::io::BufReader::new(stdin).lines();
-    let url = mcp_url(&config.burp_url);
 
     while let Some(line) = lines.next_line().await? {
         if is_empty_line(&line) {
             continue;
         }
         match client
-            .post(&url)
+            .post(&session_url)
             .header("Content-Type", "application/json")
             .body(line)
             .send()
@@ -43,16 +58,6 @@ pub async fn run(client: Arc<reqwest::Client>, config: Arc<Config>) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn mcp_url_appends_mcp_path() {
-        assert_eq!(mcp_url("http://127.0.0.1:9876"), "http://127.0.0.1:9876/mcp");
-    }
-
-    #[test]
-    fn mcp_url_with_trailing_slash() {
-        assert_eq!(mcp_url("http://127.0.0.1:9876/"), "http://127.0.0.1:9876//mcp");
-    }
 
     #[test]
     fn empty_line_is_skipped() {
