@@ -5,7 +5,7 @@ use dashmap::DashMap;
 
 pub struct SnapshotCache {
     entries: DashMap<String, CachedSnapshot>,
-    recency: Mutex<Vec<String>>,  // front=oldest, back=newest
+    recency: Mutex<std::collections::VecDeque<String>>,  // front=oldest, back=newest
     max_size_bytes: usize,
     current_size_bytes: AtomicUsize,
 }
@@ -21,7 +21,7 @@ impl SnapshotCache {
     pub fn new(max_size_bytes: usize, _ttl: Duration) -> Self {
         Self {
             entries: DashMap::new(),
-            recency: Mutex::new(Vec::new()),
+            recency: Mutex::new(std::collections::VecDeque::new()),
             max_size_bytes,
             current_size_bytes: AtomicUsize::new(0),
         }
@@ -46,7 +46,7 @@ impl SnapshotCache {
 
         {
             let mut recency = self.recency.lock().unwrap();
-            recency.push(id.clone());
+            recency.push_back(id.clone());
         }
 
         self.evict_if_over_limit();
@@ -58,7 +58,9 @@ impl SnapshotCache {
         let entry = self.entries.get(id)?;
         if entry.created_at.elapsed() > ttl {
             drop(entry);
-            self.entries.remove(id);
+            if let Some((_, snapshot)) = self.entries.remove(id) {
+                self.current_size_bytes.fetch_sub(snapshot.size_bytes, Ordering::Relaxed);
+            }
             return None;
         }
         Some(entry)
@@ -69,7 +71,7 @@ impl SnapshotCache {
             let oldest = {
                 let mut recency = self.recency.lock().unwrap();
                 if recency.is_empty() { break; }
-                recency.remove(0)
+                recency.pop_front().unwrap()
             };
             if let Some((_, snapshot)) = self.entries.remove(&oldest) {
                 self.current_size_bytes.fetch_sub(snapshot.size_bytes, Ordering::Relaxed);
@@ -123,8 +125,8 @@ mod tests {
     fn get_expired_returns_none() {
         let cache = SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600));
         let id = cache.insert("ph", "get_proxy_http_history".into(), make_items(1));
-        // TTL of 0 means immediately expired
-        assert!(cache.get(&id, Duration::from_secs(0)).is_none());
+        std::thread::sleep(Duration::from_millis(1));
+        assert!(cache.get(&id, Duration::from_nanos(1)).is_none());
     }
 
     #[test]
