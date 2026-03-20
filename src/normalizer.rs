@@ -73,6 +73,13 @@ fn parse_history_line(line: &str) -> Value {
         return parsed;
     }
 
+    // Collaborator interactions: structured JSON with type field (DNS/HTTP/SMTP)
+    if let Some(t) = parsed.get("type").and_then(|v| v.as_str()) {
+        if matches!(t, "DNS" | "HTTP" | "SMTP") {
+            return parsed;
+        }
+    }
+
     // req_raw/resp_raw contain JSON-decoded strings: Burp encodes CRLF as \r\n in JSON,
     // so these strings contain actual CR+LF bytes after serde_json decoding.
     let req_raw = parsed["request"].as_str().unwrap_or("");
