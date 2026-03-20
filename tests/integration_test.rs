@@ -37,12 +37,15 @@ async fn test_tools_list_passthrough() {
     );
 
     // 2. Read the initial "endpoint" SSE event to extract the session ID.
-    //    Burp sends: event: endpoint\ndata: ?sessionId=<uuid>\n\n
-    //    Accumulate until we have a complete event block (ending with \n\n) to
-    //    guard against TCP chunking splitting the data: line mid-value.
+    //    Burp sends: event: endpoint\r\ndata: ?sessionId=<uuid>\n
+    //    NOTE: Burp uses mixed line endings and does NOT send a trailing \n\n
+    //    terminator — the stream stays open.  We therefore accumulate chunks
+    //    and break as soon as we see a data: ?sessionId= line, rather than
+    //    waiting for \n\n which never arrives.
     use futures::StreamExt;
     let mut sse_stream = sse_resp.bytes_stream();
     let mut preamble = String::new();
+    let mut session_id: Option<String> = None;
 
     let preamble_timeout = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -50,8 +53,13 @@ async fn test_tools_list_passthrough() {
             while let Some(chunk) = sse_stream.next().await {
                 let chunk = chunk.expect("stream error reading preamble");
                 preamble.push_str(&String::from_utf8_lossy(&chunk));
-                if preamble.contains("\n\n") {
-                    break;
+                // Check each line accumulated so far (strip \r so CRLF works too)
+                for raw_line in preamble.lines() {
+                    let line = raw_line.trim_end_matches('\r');
+                    if let Some(val) = line.strip_prefix("data: ?sessionId=") {
+                        session_id = Some(val.trim_end_matches('\r').to_string());
+                        return; // found what we need
+                    }
                 }
             }
         },
@@ -59,15 +67,6 @@ async fn test_tools_list_passthrough() {
     .await;
     assert!(preamble_timeout.is_ok(), "Timed out waiting for SSE endpoint event");
 
-    // Parse the endpoint event block (inline, same logic as parse_event in sse_task)
-    let event_block = preamble.split("\n\n").next().unwrap_or("");
-    let mut session_id = None;
-    for line in event_block.lines() {
-        if let Some(val) = line.strip_prefix("data: ?sessionId=") {
-            session_id = Some(val.to_string());
-            break;
-        }
-    }
     let session_id = session_id.expect("no sessionId in endpoint event");
 
     assert!(
@@ -97,17 +96,32 @@ async fn test_tools_list_passthrough() {
     );
 
     // 4. Read the "message" event from the SSE stream (response arrives here).
-    //    Accumulate until we have a complete event block (ending with \n\n) to
-    //    guard against TCP chunking splitting the data: line mid-value.
+    //    Burp does not send a \n\n terminator, so we accumulate lines and break
+    //    as soon as we have both an event: message line and a data: line in the
+    //    same event block (separated from the preamble by at least one blank /
+    //    non-data line).
     let mut received = String::new();
+    let mut rpc_payload: Option<String> = None;
+
     let timeout = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(10),
         async {
+            let mut in_message_event = false;
             while let Some(chunk) = sse_stream.next().await {
                 let chunk = chunk.expect("stream error");
-                received.push_str(&String::from_utf8_lossy(&chunk));
-                if received.contains("\n\n") {
-                    break;
+                let text = String::from_utf8_lossy(&chunk).to_string();
+                received.push_str(&text);
+                // Process newly arrived lines
+                for raw_line in text.lines() {
+                    let line = raw_line.trim_end_matches('\r');
+                    if line == "event: message" {
+                        in_message_event = true;
+                    } else if in_message_event {
+                        if let Some(d) = line.strip_prefix("data: ") {
+                            rpc_payload = Some(d.trim_end_matches('\r').to_string());
+                            return; // got what we need
+                        }
+                    }
                 }
             }
         },
@@ -115,25 +129,12 @@ async fn test_tools_list_passthrough() {
     .await;
     assert!(timeout.is_ok(), "Timed out waiting for SSE response");
 
-    // Find the message event block and verify it's valid JSON-RPC (result or error)
-    for block in received.split("\n\n") {
-        let mut is_message = false;
-        let mut data_payload = None;
-        for line in block.lines() {
-            if line == "event: message" { is_message = true; }
-            if let Some(d) = line.strip_prefix("data: ") { data_payload = Some(d.to_string()); }
-        }
-        if is_message {
-            if let Some(payload) = data_payload {
-                let json: serde_json::Value = serde_json::from_str(&payload)
-                    .expect("SSE data is not valid JSON");
-                assert!(
-                    json.get("result").is_some() || json.get("error").is_some(),
-                    "Expected result or error in response: {json}"
-                );
-                return;
-            }
-        }
-    }
-    panic!("No message event found in SSE output");
+    // Verify the payload is valid JSON-RPC (result or error)
+    let payload = rpc_payload.expect("No data line found in message event");
+    let json: serde_json::Value = serde_json::from_str(&payload)
+        .expect("SSE data is not valid JSON");
+    assert!(
+        json.get("result").is_some() || json.get("error").is_some(),
+        "Expected result or error in response: {json}"
+    );
 }
