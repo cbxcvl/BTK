@@ -2,10 +2,12 @@ use clap::Parser;
 
 mod config;
 mod proxy;
-mod sse_task;
 mod stdin_task;
+mod sse_task;
 
-fn main() {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let config = config::Config::parse();
-    eprintln!("btk starting — burp: {}", config.burp_url);
+    eprintln!("[btk] starting — burp: {}", config.burp_url);
+    proxy::run(config).await
 }
