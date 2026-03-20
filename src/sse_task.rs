@@ -134,8 +134,9 @@ async fn stream_sse(
                         } else {
                             data.to_string()
                         };
-                        stdout.write_all(output.as_bytes()).await?;
-                        stdout.write_all(b"\n").await?;
+                        let mut out = output.into_bytes();
+                        out.push(b'\n');
+                        stdout.write_all(&out).await?;
                         stdout.flush().await?;
                         current_event_type = None;
                     }

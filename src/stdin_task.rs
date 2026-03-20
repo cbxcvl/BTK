@@ -44,8 +44,9 @@ pub async fn run(
                 if crate::synthetic::is_synthetic(&tool_name) {
                     let ttl = config.snapshot_ttl();
                     let response = crate::synthetic::handle(&request, &cache, ttl, config.body_max_chars);
-                    stdout.write_all(response.as_bytes()).await?;
-                    stdout.write_all(b"\n").await?;
+                    let mut out = response.into_bytes();
+                    out.push(b'\n');
+                    stdout.write_all(&out).await?;
                     stdout.flush().await?;
                     continue; // Do NOT forward to Burp
                 }
