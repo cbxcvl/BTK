@@ -4,6 +4,8 @@ use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 use crate::compressor::{self, CompressorConfig};
 use crate::config::Config;
+use crate::snapshot_cache::SnapshotCache;
+use dashmap::DashMap;
 
 pub(crate) fn backoff_secs(consecutive_failures: u32, max_secs: u64) -> u64 {
     let exp = 2u64.saturating_pow(consecutive_failures.saturating_sub(1));
@@ -14,13 +16,15 @@ pub async fn run(
     client: Arc<reqwest::Client>,
     config: Arc<Config>,
     session_tx: tokio::sync::watch::Sender<Option<String>>,
+    cache: Arc<SnapshotCache>,
+    inflight: Arc<DashMap<u64, String>>,
 ) -> anyhow::Result<()> {
     const MAX_FAILURES: u32 = 5;
     let compressor_config = config.compressor_config()?;
     let mut failures = 0u32;
 
     loop {
-        match stream_sse(&client, &config, &session_tx, &compressor_config).await {
+        match stream_sse(&client, &config, &session_tx, &compressor_config, &cache, &inflight).await {
             Ok(()) => {
                 // Stream ended cleanly (server closed connection) — reconnect immediately
                 failures = 0;
@@ -42,9 +46,11 @@ pub async fn run(
 
 async fn stream_sse(
     client: &reqwest::Client,
-    config: &Config,
+    config: &Arc<Config>,
     session_tx: &tokio::sync::watch::Sender<Option<String>>,
     compressor_config: &CompressorConfig,
+    cache: &Arc<SnapshotCache>,
+    inflight: &Arc<DashMap<u64, String>>,
 ) -> anyhow::Result<()> {
     let url = format!("{}/", config.burp_url);
     let response = client
@@ -92,7 +98,38 @@ async fn stream_sse(
                     Some("message") | None => {
                         // "message" is the explicit type, None means no event: line (default)
                         let output = if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) {
-                            compressor::transform(&mut value, compressor_config);
+                            // Layer 1: lossless strip (always)
+                            crate::lossless::strip(&mut value);
+
+                            // tools/list response: compress descriptions + inject synthetic tools
+                            if value.pointer("/result/tools").and_then(|t| t.as_array()).is_some() {
+                                crate::compressor::transform(&mut value, compressor_config);
+                                crate::synthetic::inject_tools(&mut value);
+                            } else {
+                                // Look up originating tool name from inflight map
+                                let tool_name = value["id"].as_u64()
+                                    .and_then(|id| inflight.remove(&id).map(|(_, v)| v));
+
+                                let grouped = if let Some(ref tname) = tool_name {
+                                    if crate::grouper::is_groupable(tname) {
+                                        crate::grouper::process(&mut value, tname, cache, config)
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+
+                                if !grouped {
+                                    // Layer 2: body truncation on items array
+                                    if let Some(items) = value.pointer_mut("/result/items").and_then(|v| v.as_array_mut()) {
+                                        for item in items.iter_mut() {
+                                            crate::body_truncate::apply_to_item(item, config.body_max_chars);
+                                        }
+                                    }
+                                }
+                            }
+
                             serde_json::to_string(&value).unwrap_or_else(|_| data.to_string())
                         } else {
                             data.to_string()

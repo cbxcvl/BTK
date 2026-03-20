@@ -1,12 +1,20 @@
+use std::sync::Arc;
+use dashmap::DashMap;
 use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncWriteExt;
+use crate::config::Config;
+use crate::snapshot_cache::SnapshotCache;
 
 fn is_empty_line(line: &str) -> bool {
     line.trim().is_empty()
 }
 
 pub async fn run(
-    client: std::sync::Arc<reqwest::Client>,
+    client: Arc<reqwest::Client>,
     session_rx: tokio::sync::watch::Receiver<Option<String>>,
+    cache: Arc<SnapshotCache>,
+    inflight: Arc<DashMap<u64, String>>,
+    config: Arc<Config>,
 ) -> anyhow::Result<()> {
     // Wait for the first session URL from the SSE handshake before processing stdin
     {
@@ -22,11 +30,32 @@ pub async fn run(
 
     let stdin = tokio::io::stdin();
     let mut lines = tokio::io::BufReader::new(stdin).lines();
+    let mut stdout = tokio::io::stdout();
 
     while let Some(line) = lines.next_line().await? {
         if is_empty_line(&line) {
             continue;
         }
+
+        // Check if this is a synthetic tool call (btk_detail, btk_next_page)
+        if let Ok(request) = serde_json::from_str::<serde_json::Value>(&line) {
+            if request["method"].as_str() == Some("tools/call") {
+                let tool_name = request["params"]["name"].as_str().unwrap_or("").to_string();
+                if crate::synthetic::is_synthetic(&tool_name) {
+                    let ttl = config.snapshot_ttl();
+                    let response = crate::synthetic::handle(&request, &cache, ttl, config.body_max_chars);
+                    stdout.write_all(response.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
+                    continue; // Do NOT forward to Burp
+                }
+                // Track non-synthetic tools/call in inflight map for sse_task correlation
+                if let Some(id) = request["id"].as_u64() {
+                    inflight.insert(id, tool_name);
+                }
+            }
+        }
+
         // Re-read the session URL on each iteration so reconnects are handled correctly
         let session_url = session_rx
             .borrow()
@@ -42,14 +71,11 @@ pub async fn run(
             Ok(resp) if !resp.status().is_success() => {
                 eprintln!("[btk] POST error: HTTP {}", resp.status());
             }
-            Err(e) => {
-                eprintln!("[btk] POST failed: {e}");
-            }
+            Err(e) => { eprintln!("[btk] POST failed: {e}"); }
             Ok(_) => {}
         }
     }
 
-    // stdin closed — signal proxy to exit
     Ok(())
 }
 
