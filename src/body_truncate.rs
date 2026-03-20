@@ -95,9 +95,15 @@ fn extract_html(body: &str) -> String {
     // Extract <title>
     let lower_body = body.to_lowercase();
     if let Some(start) = lower_body.find("<title>") {
-        if let Some(end) = lower_body[start..].find("</title>") {
-            let title = &body[start + 7..start + end];
-            out.push_str(&format!("title: {}\n", title.trim()));
+        if let Some(end_rel) = lower_body[start + 7..].find("</title>") {
+            let title_start = start + 7;
+            let title_end = title_start + end_rel;
+            // Safe: <title> and </title> are ASCII so to_lowercase() preserves byte offsets;
+            // guard with is_char_boundary for correctness on any valid UTF-8 content.
+            if body.is_char_boundary(title_start) && body.is_char_boundary(title_end) {
+                let title = &body[title_start..title_end];
+                out.push_str(&format!("title: {}\n", title.trim()));
+            }
         }
     }
 
@@ -188,7 +194,8 @@ mod tests {
             </form>
             <p>lots of content here...</p>
         </body></html>"#;
-        let result = apply_to_body(body, "text/html", 2000);
+        // max_chars=50 forces extraction since body.len() > 50
+        let result = apply_to_body(body, "text/html", 50);
         assert!(result.contains("Login"), "title missing: {result}");
         assert!(result.contains("/login"), "form action missing: {result}");
         assert!(result.contains("username"), "input missing: {result}");
