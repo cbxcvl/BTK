@@ -1,3 +1,8 @@
+use clap::Parser;
+
+mod config;
+
 fn main() {
-    println!("Hello, world!");
+    let config = config::Config::parse();
+    eprintln!("btk starting — burp: {}", config.burp_url);
 }
