@@ -1,6 +1,6 @@
 /// End-to-end test: sends tools/list to Burp via the btk binary and asserts
-/// the response contains a "tools" key. Requires BURP_URL env var and a running
-/// Burp MCP server. Skip if env var absent.
+/// the response is valid JSON-RPC (result or error). Requires BURP_URL env var
+/// and a running Burp MCP server. Skip if env var absent.
 ///
 /// Run with: BURP_URL=http://127.0.0.1:9876 cargo test -- --include-ignored
 ///
@@ -38,25 +38,37 @@ async fn test_tools_list_passthrough() {
 
     // 2. Read the initial "endpoint" SSE event to extract the session ID.
     //    Burp sends: event: endpoint\ndata: ?sessionId=<uuid>\n\n
+    //    Accumulate until we have a complete event block (ending with \n\n) to
+    //    guard against TCP chunking splitting the data: line mid-value.
     use futures::StreamExt;
-    let mut stream = sse_resp.bytes_stream();
+    let mut sse_stream = sse_resp.bytes_stream();
     let mut preamble = String::new();
 
-    let session_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.expect("stream error reading preamble");
-            preamble.push_str(&String::from_utf8_lossy(&chunk));
-            // Look for the data line with the session ID
-            for line in preamble.lines() {
-                if let Some(suffix) = line.strip_prefix("data: ?sessionId=") {
-                    return suffix.trim().to_string();
+    let preamble_timeout = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        async {
+            while let Some(chunk) = sse_stream.next().await {
+                let chunk = chunk.expect("stream error reading preamble");
+                preamble.push_str(&String::from_utf8_lossy(&chunk));
+                if preamble.contains("\n\n") {
+                    break;
                 }
             }
+        },
+    )
+    .await;
+    assert!(preamble_timeout.is_ok(), "Timed out waiting for SSE endpoint event");
+
+    // Parse the endpoint event block (inline, same logic as parse_event in sse_task)
+    let event_block = preamble.split("\n\n").next().unwrap_or("");
+    let mut session_id = None;
+    for line in event_block.lines() {
+        if let Some(val) = line.strip_prefix("data: ?sessionId=") {
+            session_id = Some(val.to_string());
+            break;
         }
-        String::new()
-    })
-    .await
-    .expect("Timed out waiting for SSE endpoint event");
+    }
+    let session_id = session_id.expect("no sessionId in endpoint event");
 
     assert!(
         !session_id.is_empty(),
@@ -84,39 +96,44 @@ async fn test_tools_list_passthrough() {
         post_resp.status()
     );
 
-    // 4. Read the "message" event from the SSE stream (response arrives here)
+    // 4. Read the "message" event from the SSE stream (response arrives here).
+    //    Accumulate until we have a complete event block (ending with \n\n) to
+    //    guard against TCP chunking splitting the data: line mid-value.
     let mut received = String::new();
     let timeout = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         async {
-            while let Some(chunk) = stream.next().await {
+            while let Some(chunk) = sse_stream.next().await {
                 let chunk = chunk.expect("stream error");
                 received.push_str(&String::from_utf8_lossy(&chunk));
-                if received.contains("data: ") {
+                if received.contains("\n\n") {
                     break;
                 }
             }
         },
     )
     .await;
-
     assert!(timeout.is_ok(), "Timed out waiting for SSE response");
-    assert!(
-        received.contains("data: "),
-        "No data: event received. Got: {received}"
-    );
 
-    // Extract the data payload and verify it's valid JSON with a "result" key
-    for line in received.lines() {
-        if let Some(payload) = line.strip_prefix("data: ") {
-            let json: serde_json::Value =
-                serde_json::from_str(payload).expect("SSE data is not valid JSON");
-            assert!(
-                json.get("result").is_some() || json.get("error").is_some(),
-                "Expected result or error in response: {json}"
-            );
-            return;
+    // Find the message event block and verify it's valid JSON-RPC (result or error)
+    for block in received.split("\n\n") {
+        let mut is_message = false;
+        let mut data_payload = None;
+        for line in block.lines() {
+            if line == "event: message" { is_message = true; }
+            if let Some(d) = line.strip_prefix("data: ") { data_payload = Some(d.to_string()); }
+        }
+        if is_message {
+            if let Some(payload) = data_payload {
+                let json: serde_json::Value = serde_json::from_str(&payload)
+                    .expect("SSE data is not valid JSON");
+                assert!(
+                    json.get("result").is_some() || json.get("error").is_some(),
+                    "Expected result or error in response: {json}"
+                );
+                return;
+            }
         }
     }
-    panic!("No data: line found in SSE output");
+    panic!("No message event found in SSE output");
 }

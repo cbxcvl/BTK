@@ -88,6 +88,9 @@ async fn stream_sse(
     Ok(())
 }
 
+/// Parse a complete SSE event block into (event_type, data_value).
+/// Note: multi-line `data:` fields per the WHATWG SSE spec are not supported;
+/// Burp MCP always sends single-line data values.
 pub(crate) fn parse_event(event_block: &str) -> Option<(&str, &str)> {
     let mut event_type = None;
     let mut data = None;

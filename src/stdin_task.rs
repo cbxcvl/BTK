@@ -1,31 +1,24 @@
-use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
-use crate::config::Config;
 
 fn is_empty_line(line: &str) -> bool {
     line.trim().is_empty()
 }
 
 pub async fn run(
-    client: Arc<reqwest::Client>,
-    _config: Arc<Config>,
-    mut session_rx: tokio::sync::watch::Receiver<Option<String>>,
+    client: std::sync::Arc<reqwest::Client>,
+    session_rx: tokio::sync::watch::Receiver<Option<String>>,
 ) -> anyhow::Result<()> {
-    // Wait for the session URL from the SSE handshake before processing stdin
-    let session_url = loop {
-        {
-            let url = session_rx.borrow();
-            if url.is_some() {
-                break url.clone().unwrap();
-            }
+    // Wait for the first session URL from the SSE handshake before processing stdin
+    {
+        let mut rx = session_rx.clone();
+        while rx.borrow().is_none() {
+            rx.changed()
+                .await
+                .map_err(|_| anyhow::anyhow!("session channel closed before handshake"))?;
         }
-        session_rx
-            .changed()
-            .await
-            .map_err(|_| anyhow::anyhow!("session channel closed before handshake"))?;
-    };
+    }
 
-    eprintln!("[btk] Session URL ready, forwarding stdin to {session_url}");
+    eprintln!("[btk] Session URL ready, forwarding stdin");
 
     let stdin = tokio::io::stdin();
     let mut lines = tokio::io::BufReader::new(stdin).lines();
@@ -34,6 +27,11 @@ pub async fn run(
         if is_empty_line(&line) {
             continue;
         }
+        // Re-read the session URL on each iteration so reconnects are handled correctly
+        let session_url = session_rx
+            .borrow()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("session URL unexpectedly None"))?;
         match client
             .post(&session_url)
             .header("Content-Type", "application/json")

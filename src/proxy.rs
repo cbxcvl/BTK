@@ -7,7 +7,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let (session_tx, session_rx) = tokio::sync::watch::channel::<Option<String>>(None);
 
-    let stdin_handle = tokio::spawn(crate::stdin_task::run(client.clone(), config.clone(), session_rx));
+    let stdin_handle = tokio::spawn(crate::stdin_task::run(client.clone(), session_rx));
     let sse_handle = tokio::spawn(crate::sse_task::run(client.clone(), config.clone(), session_tx));
 
     tokio::select! {
