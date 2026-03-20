@@ -10,6 +10,7 @@ mod config;
 mod proxy;
 mod stdin_task;
 mod sse_task;
+mod http_parse;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
