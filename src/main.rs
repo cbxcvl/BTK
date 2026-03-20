@@ -2,6 +2,7 @@ use clap::Parser;
 
 mod config;
 mod sse_task;
+mod stdin_task;
 
 fn main() {
     let config = config::Config::parse();
