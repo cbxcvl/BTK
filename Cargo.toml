@@ -17,3 +17,4 @@ futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 phf = { version = "0.11", features = ["macros"] }
+dashmap = "5"

@@ -19,6 +19,18 @@ pub struct Config {
     /// Example: --tools send_http1_request,get_proxy_http_history
     #[arg(long)]
     pub tools: Option<String>,
+
+    /// Maximum characters for response body truncation (0 = disabled)
+    #[arg(long, default_value_t = 2000)]
+    pub body_max_chars: usize,
+
+    /// Snapshot TTL in seconds
+    #[arg(long, default_value_t = 600)]
+    pub snapshot_ttl_secs: u64,
+
+    /// Maximum snapshot cache size in megabytes
+    #[arg(long, default_value_t = 50)]
+    pub snapshot_max_mb: usize,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -65,5 +77,13 @@ impl Config {
         }
 
         Ok(config)
+    }
+
+    pub fn snapshot_max_bytes(&self) -> usize {
+        self.snapshot_max_mb * 1024 * 1024
+    }
+
+    pub fn snapshot_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.snapshot_ttl_secs)
     }
 }
