@@ -33,4 +33,17 @@ mod tests {
     fn returns_none_for_id_line() {
         assert_eq!(parse_sse_data("id: 42"), None);
     }
+
+    #[test]
+    fn returns_none_for_data_without_space() {
+        // SSE spec allows "data:<value>" (no space) but we only handle "data: <value>"
+        // Burp MCP server always sends the space, so this is intentionally not supported
+        assert_eq!(parse_sse_data("data:{}"), None);
+    }
+
+    #[test]
+    fn returns_some_empty_for_data_with_empty_value() {
+        // "data: " (trailing space only) is a valid empty data field
+        assert_eq!(parse_sse_data("data: "), Some("".to_string()));
+    }
 }
