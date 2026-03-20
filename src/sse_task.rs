@@ -63,18 +63,32 @@ async fn stream_sse(
         anyhow::bail!("SSE endpoint returned HTTP {}", response.status());
     }
 
+    const MAX_LINE_BYTES: usize = 16 * 1024 * 1024; // 16 MB hard cap per SSE line
     let mut stream = response.bytes_stream();
     let mut stdout = tokio::io::stdout();
-    let mut buf = String::new();
+    let mut buf = Vec::<u8>::new();
     let mut current_event_type: Option<String> = None;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
-        buf.push_str(&String::from_utf8_lossy(&chunk));
+        buf.extend_from_slice(&chunk);
 
-        while let Some(pos) = buf.find('\n') {
-            let line = buf[..pos].trim_end_matches('\r').to_string();
-            buf = buf[pos + 1..].to_string();
+        if buf.len() > MAX_LINE_BYTES && !buf.contains(&b'\n') {
+            anyhow::bail!("SSE line exceeds {MAX_LINE_BYTES} bytes without newline — aborting");
+        }
+
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let raw_line = &buf[..pos];
+            let raw_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+            // SSE protocol lines are UTF-8; drop lines that aren't valid UTF-8
+            let line = match std::str::from_utf8(raw_line) {
+                Ok(s) => s.to_string(),
+                Err(_) => {
+                    buf.drain(..pos + 1);
+                    continue;
+                }
+            };
+            buf.drain(..pos + 1);
 
             if line.is_empty() {
                 // blank line resets event state (standard SSE separator)
