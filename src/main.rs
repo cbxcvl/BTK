@@ -11,6 +11,7 @@ mod proxy;
 mod stdin_task;
 mod sse_task;
 mod http_parse;
+mod normalizer;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
