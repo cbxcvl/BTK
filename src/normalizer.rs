@@ -19,6 +19,9 @@ pub fn normalize_response(value: &mut Value, tool_name: &str) {
         build_history_items(&text)
     } else if is_single_response_tool(tool_name) {
         build_single_item(&text)
+    } else if is_plain_json_tool(tool_name) {
+        // Returns a single JSON blob (e.g. project config) — preserve as one item
+        build_single_item(&text)
     } else {
         // Unknown tool: try multi if text has newlines with JSON objects, else single
         if text.trim_start().starts_with('{') && text.contains('\n') {
@@ -47,6 +50,10 @@ fn is_single_response_tool(tool: &str) -> bool {
         tool,
         "send_http1_request" | "send_http2_request" | "get_active_editor_contents"
     )
+}
+
+fn is_plain_json_tool(tool: &str) -> bool {
+    matches!(tool, "output_project_options" | "output_user_options")
 }
 
 fn build_history_items(text: &str) -> Vec<Value> {
@@ -99,12 +106,17 @@ fn parse_history_line(line: &str) -> Value {
 }
 
 fn build_single_item(text: &str) -> Vec<Value> {
-    // Try JSON first (scanner single item, get_active_editor_contents, etc.)
+    // Try JSON first (scanner single item, get_active_editor_contents, config blobs, etc.)
     if let Ok(parsed) = serde_json::from_str::<Value>(text) {
         if parsed.get("request").is_some() || parsed.get("response").is_some() {
             return vec![parse_history_line(text)];
         }
         return vec![parsed];
+    }
+
+    // Try Burp's Java toString format: HttpRequestResponse{httpRequest=..., httpResponse=..., ...}
+    if let Some(item) = try_parse_java_http_response_response(text) {
+        return vec![item];
     }
 
     // Try as raw HTTP response string
@@ -121,6 +133,47 @@ fn build_single_item(text: &str) -> Vec<Value> {
 
     // Fallback
     vec![json!({ "raw": text })]
+}
+
+/// Parse Burp's Java toString format:
+/// `HttpRequestResponse{httpRequest=<raw HTTP>, httpResponse=<raw HTTP>, messageAnnotations=...}`
+fn try_parse_java_http_response_response(text: &str) -> Option<Value> {
+    let inner = text.strip_prefix("HttpRequestResponse{")?;
+    let inner = inner.strip_suffix('}')?;
+
+    // Strip messageAnnotations suffix to isolate the two HTTP fields
+    let inner = if let Some(pos) = inner.rfind(", messageAnnotations=") {
+        &inner[..pos]
+    } else {
+        inner
+    };
+
+    // inner is now "httpRequest=<REQ>, httpResponse=<RESP>"
+    let inner = inner.strip_prefix("httpRequest=")?;
+    let resp_pos = inner.find(", httpResponse=")?;
+    let req_raw = &inner[..resp_pos];
+    let resp_raw = &inner[resp_pos + ", httpResponse=".len()..];
+
+    let request = match http_parse::parse_request(req_raw) {
+        Some(req) => json!({
+            "method": req.method,
+            "path": req.path,
+            "headers": headers_to_json(&req.headers),
+            "body": req.body,
+        }),
+        None => json!({ "raw": req_raw }),
+    };
+
+    let response = match http_parse::parse_response(resp_raw) {
+        Some(resp) => json!({
+            "statusCode": resp.status_code,
+            "headers": headers_to_json(&resp.headers),
+            "body": resp.body,
+        }),
+        None => json!({ "raw": resp_raw }),
+    };
+
+    Some(json!({ "request": request, "response": response }))
 }
 
 fn headers_to_json(headers: &[http_parse::HttpHeader]) -> Vec<Value> {
@@ -256,6 +309,31 @@ mod tests {
 
         let items = value.pointer("/result/items").and_then(|v| v.as_array()).unwrap();
         assert_eq!(items.len(), 1, "blank lines should be filtered");
+    }
+
+    #[test]
+    fn plain_json_tool_preserves_config_as_single_item() {
+        let config = "{\"bambda\":{\"filter\":\"enabled\"},\"scope\":{\"include\":[]}}";
+        let mut value = make_content_response(config);
+        normalize_response(&mut value, "output_project_options");
+
+        let items = value.pointer("/result/items").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(items.len(), 1, "config JSON should be a single item, not split by lines");
+        assert!(items[0].get("bambda").is_some(), "config fields should be preserved");
+    }
+
+    #[test]
+    fn java_tostring_format_is_parsed_into_request_response() {
+        let text = "HttpRequestResponse{httpRequest=GET / HTTP/1.1\r\nHost: example.com\r\n\r\n, httpResponse=HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\nhello, messageAnnotations=Annotations{comment='', highlightColor=NONE}}";
+        let mut value = make_content_response(text);
+        normalize_response(&mut value, "send_http1_request");
+
+        let items = value.pointer("/result/items").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["request"]["method"].as_str().unwrap(), "GET");
+        assert_eq!(items[0]["request"]["path"].as_str().unwrap(), "/");
+        assert_eq!(items[0]["response"]["statusCode"].as_u64().unwrap(), 200);
+        assert_eq!(items[0]["response"]["body"].as_str().unwrap(), "hello");
     }
 
     #[test]

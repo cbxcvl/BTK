@@ -35,8 +35,8 @@ static BUILTIN: phf::Map<&str, &str> = phf::phf_map! {
     "get_proxy_http_history_regex"   => "Get proxy HTTP history entries matching regex (paginated).",
     "get_proxy_websocket_history"    => "Get proxy WebSocket history (paginated).",
     "get_proxy_websocket_history_regex" => "Get proxy WebSocket history entries matching regex (paginated).",
-    "set_task_execution_engine_state"=> "Pause or unpause Burp task engine.",
-    "set_proxy_intercept_state"      => "Enable or disable Proxy intercept.",
+    "set_task_execution_engine_state"=> "Set Burp task engine state (running: true=resume, false=pause).",
+    "set_proxy_intercept_state"      => "Set Proxy intercept state (intercepting: true=on, false=off).",
     "get_active_editor_contents"     => "Get contents of active message editor.",
     "set_active_editor_contents"     => "Set contents of active message editor.",
 };
