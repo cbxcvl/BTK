@@ -21,7 +21,7 @@ pub fn process(
     value: &mut serde_json::Value,
     tool_name: &str,
     cache: &Arc<SnapshotCache>,
-    config: &Config,
+    _config: &Config,
 ) -> bool {
     let items = match value.pointer("/result/items").and_then(|v| v.as_array()) {
         Some(arr) if !arr.is_empty() => arr.to_vec(),

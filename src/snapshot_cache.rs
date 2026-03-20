@@ -18,6 +18,7 @@ pub struct CachedSnapshot {
 }
 
 impl SnapshotCache {
+    /// `_ttl` is accepted for API consistency but TTL is checked lazily on `get()`, not at construction time.
     pub fn new(max_size_bytes: usize, _ttl: Duration) -> Self {
         Self {
             entries: DashMap::new(),
