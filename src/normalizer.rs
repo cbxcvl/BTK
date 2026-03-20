@@ -66,6 +66,8 @@ fn parse_history_line(line: &str) -> Value {
         return parsed;
     }
 
+    // req_raw/resp_raw contain JSON-decoded strings: Burp encodes CRLF as \r\n in JSON,
+    // so these strings contain actual CR+LF bytes after serde_json decoding.
     let req_raw = parsed["request"].as_str().unwrap_or("");
     let resp_raw = parsed["response"].as_str().unwrap_or("");
     let notes = parsed["notes"].as_str().unwrap_or("").to_string();
@@ -254,5 +256,23 @@ mod tests {
 
         let items = value.pointer("/result/items").and_then(|v| v.as_array()).unwrap();
         assert_eq!(items.len(), 1, "blank lines should be filtered");
+    }
+
+    #[test]
+    fn unknown_tool_with_multiline_json_uses_history_path() {
+        let line1 = r#"{"request":"GET /a HTTP/1.1\r\nHost: x\r\n\r\n","response":"HTTP/1.1 200 OK\r\n\r\n","notes":""}"#;
+        let line2 = r#"{"request":"GET /b HTTP/1.1\r\nHost: x\r\n\r\n","response":"HTTP/1.1 404 Not Found\r\n\r\n","notes":""}"#;
+        let text = format!("{}\n{}", line1, line2);
+        let mut value = json!({
+            "id": 1,
+            "result": {
+                "content": [{"text": text, "type": "text"}],
+                "isError": false
+            }
+        });
+        normalize_response(&mut value, "some_unrecognized_tool");
+        let items = value.pointer("/result/items").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(items.len(), 2, "unknown multi-line JSON tool should use history path");
+        assert_eq!(items[0]["request"]["method"].as_str().unwrap(), "GET");
     }
 }
