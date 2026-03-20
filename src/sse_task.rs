@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
+use crate::compressor::{self, CompressorConfig};
 use crate::config::Config;
 
 pub(crate) fn backoff_secs(consecutive_failures: u32, max_secs: u64) -> u64 {
@@ -15,10 +16,11 @@ pub async fn run(
     session_tx: tokio::sync::watch::Sender<Option<String>>,
 ) -> anyhow::Result<()> {
     const MAX_FAILURES: u32 = 5;
+    let compressor_config = config.compressor_config()?;
     let mut failures = 0u32;
 
     loop {
-        match stream_sse(&client, &config, &session_tx).await {
+        match stream_sse(&client, &config, &session_tx, &compressor_config).await {
             Ok(()) => {
                 // Stream ended cleanly (server closed connection) — reconnect immediately
                 failures = 0;
@@ -42,6 +44,7 @@ async fn stream_sse(
     client: &reqwest::Client,
     config: &Config,
     session_tx: &tokio::sync::watch::Sender<Option<String>>,
+    compressor_config: &CompressorConfig,
 ) -> anyhow::Result<()> {
     let url = format!("{}/", config.burp_url);
     let response = client
@@ -88,7 +91,13 @@ async fn stream_sse(
                     }
                     Some("message") | None => {
                         // "message" is the explicit type, None means no event: line (default)
-                        stdout.write_all(data.as_bytes()).await?;
+                        let output = if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) {
+                            compressor::transform(&mut value, compressor_config);
+                            serde_json::to_string(&value).unwrap_or_else(|_| data.to_string())
+                        } else {
+                            data.to_string()
+                        };
+                        stdout.write_all(output.as_bytes()).await?;
                         stdout.write_all(b"\n").await?;
                         stdout.flush().await?;
                         current_event_type = None;

@@ -137,4 +137,22 @@ async fn test_tools_list_passthrough() {
         json.get("result").is_some() || json.get("error").is_some(),
         "Expected result or error in response: {json}"
     );
+
+    // Verify descriptions are compressed by the proxy
+    if let Some(tools) = json["result"]["tools"].as_array() {
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap_or("");
+            if name == "send_http1_request" {
+                assert_eq!(
+                    tool["description"].as_str().unwrap_or(""),
+                    "Send HTTP/1.1 request, return response.",
+                    "Description was not compressed for send_http1_request"
+                );
+            }
+        }
+        assert!(
+            json["result"]["_meta"].is_null(),
+            "_meta should be stripped from tools/list response"
+        );
+    }
 }

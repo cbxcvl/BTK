@@ -1,5 +1,6 @@
 use clap::Parser;
 
+mod compressor;
 mod config;
 mod proxy;
 mod stdin_task;
