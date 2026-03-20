@@ -40,16 +40,24 @@ pub fn process(
 
     let total = items.len();
     let page_size = 20;
-    let mut full_summary = format!("BTK proxy history snapshot {snapshot_id} ({total} items):\n{summary}");
+    let header = if prefix == "sc" {
+        format!("BTK scanner snapshot {snapshot_id} ({total} issues):\n{summary}")
+    } else {
+        format!("BTK proxy history snapshot {snapshot_id} ({total} items):\n{summary}")
+    };
+    let mut full_summary = header;
     if total > page_size {
         full_summary.push_str(&format!(
             "\nUse btk_next_page(snapshot=\"{snapshot_id}\", cursor={page_size}) for items {}-{}.",
             page_size + 1, total
         ));
     }
-    full_summary.push_str(&format!(
-        "\nUse btk_detail(snapshot=\"{snapshot_id}\", path=\"<path>\") to expand."
-    ));
+    let detail_hint = if prefix == "sc" {
+        format!("\nUse btk_detail(snapshot=\"{snapshot_id}\", path=\"<issue_type>\") to expand an issue type.")
+    } else {
+        format!("\nUse btk_detail(snapshot=\"{snapshot_id}\", path=\"<METHOD /path>\") to expand a path.")
+    };
+    full_summary.push_str(&detail_hint);
 
     value["result"] = serde_json::Value::String(full_summary);
     true
@@ -201,13 +209,47 @@ mod tests {
         ]);
         process(&mut value, "get_proxy_http_history", &cache, &config);
         let summary = value["result"].as_str().unwrap();
-        // Extract snapshot id from summary
-        let snap_id = summary.split_whitespace()
+        // The summary starts with "BTK proxy history snapshot ph_XXXXXXXX ("
+        // Split on ' ' and find the token starting with "ph_"
+        let snap_id = summary.split(' ')
             .find(|w| w.starts_with("ph_"))
             .unwrap_or("")
-            .trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+            .to_string();
         assert!(!snap_id.is_empty(), "no snapshot id found in: {summary}");
-        assert!(cache.get(snap_id, Duration::from_secs(600)).is_some());
+        assert!(cache.get(&snap_id, Duration::from_secs(600)).is_some(), "snapshot not in cache: {snap_id}");
+    }
+
+    fn make_scanner_item(severity: &str, issue_name: &str) -> serde_json::Value {
+        json!({
+            "severity": severity,
+            "issueName": issue_name,
+            "url": "https://example.com/api",
+            "description": "Issue description"
+        })
+    }
+
+    #[test]
+    fn process_scanner_returns_severity_summary() {
+        let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
+        let config = make_config();
+        let mut value = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "items": [
+                make_scanner_item("high", "SQL Injection"),
+                make_scanner_item("high", "SQL Injection"),
+                make_scanner_item("medium", "CSRF"),
+                make_scanner_item("critical", "OS Command Injection"),
+            ]}
+        });
+        let applied = process(&mut value, "get_scanner_issues", &cache, &config);
+        assert!(applied);
+        let summary = value["result"].as_str().unwrap();
+        assert!(summary.contains("sc_"), "no scanner snapshot id: {summary}");
+        assert!(summary.contains("BTK scanner snapshot"), "wrong header: {summary}");
+        assert!(summary.contains("Critical"), "missing critical: {summary}");
+        assert!(summary.contains("High"), "missing high: {summary}");
+        assert!(summary.contains("SQL Injection"), "missing issue type: {summary}");
+        assert!(summary.contains("CSRF"), "missing csrf: {summary}");
     }
 
     #[test]
