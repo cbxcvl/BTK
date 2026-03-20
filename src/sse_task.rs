@@ -57,29 +57,46 @@ async fn stream_sse(
     let mut stream = response.bytes_stream();
     let mut stdout = tokio::io::stdout();
     let mut buf = String::new();
+    let mut current_event_type: Option<String> = None;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         buf.push_str(&String::from_utf8_lossy(&chunk));
 
-        // Process all complete events in the buffer (events separated by \n\n)
-        while let Some(pos) = buf.find("\n\n") {
-            let event_block = buf[..pos].to_string();
-            buf = buf[pos + 2..].to_string();
+        while let Some(pos) = buf.find('\n') {
+            let line = buf[..pos].trim_end_matches('\r').to_string();
+            buf = buf[pos + 1..].to_string();
 
-            if let Some((event_type, data)) = parse_event(&event_block) {
-                match event_type {
-                    "endpoint" => {
+            if line.is_empty() {
+                // blank line resets event state (standard SSE separator)
+                current_event_type = None;
+                continue;
+            }
+
+            if let Some(event_type) = line.strip_prefix("event: ") {
+                current_event_type = Some(event_type.to_string());
+                continue;
+            }
+
+            if let Some(data) = line.strip_prefix("data: ") {
+                match current_event_type.as_deref() {
+                    Some("endpoint") => {
                         let session_url = format!("{}{}", config.burp_url, data);
                         eprintln!("[btk] Got session URL: {session_url}");
                         let _ = session_tx.send(Some(session_url));
+                        current_event_type = None;
                     }
-                    "message" => {
+                    Some("message") | None => {
+                        // "message" is the explicit type, None means no event: line (default)
                         stdout.write_all(data.as_bytes()).await?;
                         stdout.write_all(b"\n").await?;
                         stdout.flush().await?;
+                        current_event_type = None;
                     }
-                    _ => {} // ignore other event types
+                    Some(_) => {
+                        // ignore other event types
+                        current_event_type = None;
+                    }
                 }
             }
         }
@@ -91,6 +108,10 @@ async fn stream_sse(
 /// Parse a complete SSE event block into (event_type, data_value).
 /// Note: multi-line `data:` fields per the WHATWG SSE spec are not supported;
 /// Burp MCP always sends single-line data values.
+///
+/// Retained for reference; the live path now uses line-by-line stateful parsing
+/// because Burp does not send the standard `\n\n` event-block separator.
+#[allow(dead_code)]
 pub(crate) fn parse_event(event_block: &str) -> Option<(&str, &str)> {
     let mut event_type = None;
     let mut data = None;
@@ -104,6 +125,7 @@ pub(crate) fn parse_event(event_block: &str) -> Option<(&str, &str)> {
     event_type.zip(data)
 }
 
+/// Retained for reference; unused by the live path.
 #[allow(dead_code)]
 pub(crate) fn parse_sse_data(line: &str) -> Option<String> {
     line.strip_prefix("data: ").map(|s| s.to_string())
