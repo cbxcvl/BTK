@@ -5,7 +5,7 @@ use tokio::io::AsyncWriteExt;
 use crate::config::Config;
 
 pub(crate) fn backoff_secs(consecutive_failures: u32, max_secs: u64) -> u64 {
-    let exp = 2u64.saturating_pow(consecutive_failures - 1);
+    let exp = 2u64.saturating_pow(consecutive_failures.saturating_sub(1));
     exp.min(max_secs)
 }
 
@@ -126,5 +126,11 @@ mod tests {
         assert_eq!(backoff_secs(3, 30), 4);
         assert_eq!(backoff_secs(4, 30), 8);
         assert_eq!(backoff_secs(10, 30), 30); // capped
+    }
+
+    #[test]
+    fn backoff_secs_zero_failures_returns_one() {
+        // saturating_sub(1) on 0 → 0, so 2^0 = 1
+        assert_eq!(backoff_secs(0, 30), 1);
     }
 }
