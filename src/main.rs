@@ -1,5 +1,6 @@
 use clap::Parser;
 
+mod lossless;
 mod snapshot_cache;
 mod compressor;
 mod config;
