@@ -5,6 +5,7 @@ mod grouper;
 mod lossless;
 mod snapshot_cache;
 mod compressor;
+mod synthetic;
 mod config;
 mod proxy;
 mod stdin_task;
