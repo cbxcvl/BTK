@@ -1,6 +1,7 @@
 use clap::Parser;
 
 mod config;
+mod sse_task;
 
 fn main() {
     let config = config::Config::parse();
