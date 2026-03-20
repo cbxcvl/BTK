@@ -55,8 +55,9 @@ fn collapse_cookies(item: &mut serde_json::Value, side: &str, header_name: &str)
             });
             let collapsed = match session {
                 Some(s) => {
-                    let token: String = s.chars().take(14).collect(); // "name=first8val"
-                    format!("[{count} cookies, {token}...]")
+                    let (cname, cval) = s.split_once('=').unwrap_or((s, ""));
+                    let short_val: String = cval.chars().take(8).collect();
+                    format!("[{count} cookies, {cname}={short_val}...]")
                 }
                 None => format!("[{count} cookies]"),
             };
@@ -108,7 +109,8 @@ mod tests {
         let cookie = req_headers.iter().find(|h| h["name"] == "Cookie").unwrap();
         let val = cookie["value"].as_str().unwrap();
         assert!(val.contains("[4 cookies"), "expected count: got {val}");
-        assert!(val.contains("session=abc1"), "expected session token: got {val}");
+        // First 8 chars of cookie value "abc123def456" = "abc123de"
+        assert!(val.contains("session=abc123de"), "expected 8-char value: got {val}");
     }
 
     #[test]
@@ -134,10 +136,19 @@ mod tests {
     }
 
     #[test]
-    fn non_item_response_null_fields_not_removed_deeply() {
-        // strip only removes nulls at result level, not recursively
-        let mut value = json!({"jsonrpc": "2.0", "id": 1, "result": {"status": "ok"}});
+    fn strip_only_removes_nulls_at_result_level_not_recursively() {
+        // Top-level result nulls ARE removed
+        let mut value = json!({
+            "result": {
+                "status": "ok",
+                "extra": null,
+                "nested": {"deep_null": null}
+            }
+        });
         strip(&mut value);
-        assert_eq!(value["result"]["status"], "ok");
+        let result_obj = value["result"].as_object().unwrap();
+        assert!(!result_obj.contains_key("extra"), "top-level null should be removed");
+        // Nested nulls should NOT be removed (strip is shallow)
+        assert!(result_obj["nested"]["deep_null"].is_null(), "nested null should survive");
     }
 }
