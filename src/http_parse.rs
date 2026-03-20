@@ -1,3 +1,4 @@
+#[derive(Clone, Debug)]
 pub struct HttpRequest {
     pub method: String,
     pub path: String,
@@ -5,13 +6,14 @@ pub struct HttpRequest {
     pub body: String,
 }
 
+#[derive(Clone, Debug)]
 pub struct HttpResponse {
     pub status_code: u16,
     pub headers: Vec<HttpHeader>,
     pub body: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct HttpHeader {
     pub name: String,
     pub value: String,
