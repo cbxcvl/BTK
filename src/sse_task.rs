@@ -44,6 +44,114 @@ pub async fn run(
     }
 }
 
+fn transform_message_data(
+    data: &str,
+    config: &Arc<Config>,
+    compressor_config: &CompressorConfig,
+    cache: &Arc<SnapshotCache>,
+    inflight: &Arc<DashMap<u64, String>>,
+) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) else {
+        return data.to_string();
+    };
+
+    if value.pointer("/result/tools").and_then(|t| t.as_array()).is_some() {
+        // tools/list response: compress descriptions + inject synthetic tools
+        crate::lossless::strip(&mut value);
+        crate::compressor::transform(&mut value, compressor_config);
+        crate::synthetic::inject_tools(&mut value);
+    } else {
+        // Look up originating tool name from inflight map
+        let tool_name = value["id"].as_u64()
+            .and_then(|id| inflight.remove(&id).map(|(_, v)| v));
+
+        // Normalize Burp's content[0].text → result.items (must precede lossless)
+        if let Some(ref tname) = tool_name {
+            crate::normalizer::normalize_response(&mut value, tname);
+        }
+
+        // Layer 1: lossless strip (now result.items exists if normalization ran)
+        crate::lossless::strip(&mut value);
+
+        let grouped = match tool_name.as_deref() {
+            Some(tname) if crate::grouper::is_groupable(tname) => {
+                crate::grouper::process(&mut value, tname, cache, config)
+            }
+            _ => false,
+        };
+
+        if !grouped {
+            // Layer 2: body truncation on items array
+            if let Some(items) = value.pointer_mut("/result/items").and_then(|v| v.as_array_mut()) {
+                for item in items.iter_mut() {
+                    crate::body_truncate::apply_to_item(item, config.body_max_chars);
+                }
+            }
+        }
+    }
+
+    serde_json::to_string(&value).unwrap_or_else(|_| data.to_string())
+}
+
+fn process_data_line(
+    data: &str,
+    event_type: &Option<String>,
+    config: &Arc<Config>,
+    compressor_config: &CompressorConfig,
+    cache: &Arc<SnapshotCache>,
+    inflight: &Arc<DashMap<u64, String>>,
+    session_tx: &tokio::sync::watch::Sender<Option<String>>,
+) -> Option<Vec<u8>> {
+    match event_type.as_deref() {
+        Some("endpoint") => {
+            let session_url = format!("{}{}", config.burp_url, data);
+            eprintln!("[btk] Got session URL: {session_url}");
+            let _ = session_tx.send(Some(session_url));
+            None
+        }
+        Some("message") | None => {
+            // "message" is the explicit type, None means no event: line (default)
+            let output = transform_message_data(data, config, compressor_config, cache, inflight);
+            let mut out = output.into_bytes();
+            out.push(b'\n');
+            Some(out)
+        }
+        Some(_) => None, // ignore other event types
+    }
+}
+
+async fn process_line(
+    line: &str,
+    current_event_type: &mut Option<String>,
+    config: &Arc<Config>,
+    compressor_config: &CompressorConfig,
+    cache: &Arc<SnapshotCache>,
+    inflight: &Arc<DashMap<u64, String>>,
+    session_tx: &tokio::sync::watch::Sender<Option<String>>,
+    stdout: &mut tokio::io::Stdout,
+) -> anyhow::Result<()> {
+    if line.is_empty() {
+        // blank line resets event state (standard SSE separator)
+        *current_event_type = None;
+        return Ok(());
+    }
+
+    if let Some(event_type) = line.strip_prefix("event: ") {
+        *current_event_type = Some(event_type.to_string());
+        return Ok(());
+    }
+
+    if let Some(data) = line.strip_prefix("data: ") {
+        if let Some(out) = process_data_line(data, current_event_type, config, compressor_config, cache, inflight, session_tx) {
+            stdout.write_all(&out).await?;
+            stdout.flush().await?;
+        }
+        *current_event_type = None;
+    }
+
+    Ok(())
+}
+
 async fn stream_sse(
     client: &reqwest::Client,
     config: &Arc<Config>,
@@ -89,84 +197,7 @@ async fn stream_sse(
                 }
             };
             buf.drain(..pos + 1);
-
-            if line.is_empty() {
-                // blank line resets event state (standard SSE separator)
-                current_event_type = None;
-                continue;
-            }
-
-            if let Some(event_type) = line.strip_prefix("event: ") {
-                current_event_type = Some(event_type.to_string());
-                continue;
-            }
-
-            if let Some(data) = line.strip_prefix("data: ") {
-                match current_event_type.as_deref() {
-                    Some("endpoint") => {
-                        let session_url = format!("{}{}", config.burp_url, data);
-                        eprintln!("[btk] Got session URL: {session_url}");
-                        let _ = session_tx.send(Some(session_url));
-                        current_event_type = None;
-                    }
-                    Some("message") | None => {
-                        // "message" is the explicit type, None means no event: line (default)
-                        let output = if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) {
-                            // tools/list response: compress descriptions + inject synthetic tools
-                            if value.pointer("/result/tools").and_then(|t| t.as_array()).is_some() {
-                                // Layer 1: lossless strip (tools/list branch)
-                                crate::lossless::strip(&mut value);
-                                crate::compressor::transform(&mut value, compressor_config);
-                                crate::synthetic::inject_tools(&mut value);
-                            } else {
-                                // Look up originating tool name from inflight map
-                                let tool_name = value["id"].as_u64()
-                                    .and_then(|id| inflight.remove(&id).map(|(_, v)| v));
-
-                                // Normalize Burp's content[0].text → result.items (must precede lossless)
-                                if let Some(ref tname) = tool_name {
-                                    crate::normalizer::normalize_response(&mut value, tname);
-                                }
-
-                                // Layer 1: lossless strip (now result.items exists if normalization ran)
-                                crate::lossless::strip(&mut value);
-
-                                let grouped = if let Some(ref tname) = tool_name {
-                                    if crate::grouper::is_groupable(tname) {
-                                        crate::grouper::process(&mut value, tname, cache, config)
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                };
-
-                                if !grouped {
-                                    // Layer 2: body truncation on items array
-                                    if let Some(items) = value.pointer_mut("/result/items").and_then(|v| v.as_array_mut()) {
-                                        for item in items.iter_mut() {
-                                            crate::body_truncate::apply_to_item(item, config.body_max_chars);
-                                        }
-                                    }
-                                }
-                            }
-
-                            serde_json::to_string(&value).unwrap_or_else(|_| data.to_string())
-                        } else {
-                            data.to_string()
-                        };
-                        let mut out = output.into_bytes();
-                        out.push(b'\n');
-                        stdout.write_all(&out).await?;
-                        stdout.flush().await?;
-                        current_event_type = None;
-                    }
-                    Some(_) => {
-                        // ignore other event types
-                        current_event_type = None;
-                    }
-                }
-            }
+            process_line(&line, &mut current_event_type, config, compressor_config, cache, inflight, session_tx, &mut stdout).await?;
         }
     }
 
