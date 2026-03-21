@@ -1,3 +1,43 @@
+use futures::StreamExt;
+
+async fn read_sse_session_id(
+    stream: &mut (impl StreamExt<Item = reqwest::Result<bytes::Bytes>> + Unpin),
+) -> Option<String> {
+    let mut buf = String::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        for raw_line in buf.lines() {
+            let line = raw_line.trim_end_matches('\r');
+            if let Some(val) = line.strip_prefix("data: ") {
+                return Some(val.trim_end_matches('\r').to_string());
+            }
+        }
+    }
+    None
+}
+
+async fn read_sse_message_data(
+    stream: &mut (impl StreamExt<Item = reqwest::Result<bytes::Bytes>> + Unpin),
+) -> Option<String> {
+    let mut in_message_event = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        let text = String::from_utf8_lossy(&chunk).to_string();
+        for raw_line in text.lines() {
+            let line = raw_line.trim_end_matches('\r');
+            if line == "event: message" {
+                in_message_event = true;
+            } else if in_message_event {
+                if let Some(d) = line.strip_prefix("data: ") {
+                    return Some(d.trim_end_matches('\r').to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// End-to-end test: sends tools/list to Burp via the btk binary and asserts
 /// the response is valid JSON-RPC (result or error). Requires BURP_URL env var
 /// and a running Burp MCP server. Skip if env var absent.
@@ -19,7 +59,6 @@ async fn test_tools_list_passthrough() {
         }
     };
 
-    // Use reqwest directly to verify the Burp MCP SSE endpoint is reachable
     let client = reqwest::Client::new();
 
     // 1. Connect to SSE at root path to receive events
@@ -30,49 +69,20 @@ async fn test_tools_list_passthrough() {
         .send()
         .await
         .expect("SSE connect failed");
-    assert!(
-        sse_resp.status().is_success(),
-        "SSE endpoint returned {}",
-        sse_resp.status()
-    );
+    assert!(sse_resp.status().is_success(), "SSE endpoint returned {}", sse_resp.status());
 
-    // 2. Read the initial "endpoint" SSE event to extract the session ID.
+    // 2. Read the initial "endpoint" SSE event to extract the session ID
     //    Burp sends: event: endpoint\r\ndata: ?sessionId=<uuid>\n
-    //    NOTE: Burp uses mixed line endings and does NOT send a trailing \n\n
-    //    terminator — the stream stays open.  We therefore accumulate chunks
-    //    and break as soon as we see a data: ?sessionId= line, rather than
-    //    waiting for \n\n which never arrives.
-    use futures::StreamExt;
     let mut sse_stream = sse_resp.bytes_stream();
-    let mut preamble = String::new();
-    let mut session_id: Option<String> = None;
-
-    let preamble_timeout = tokio::time::timeout(
+    let session_id = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        async {
-            while let Some(chunk) = sse_stream.next().await {
-                let chunk = chunk.expect("stream error reading preamble");
-                preamble.push_str(&String::from_utf8_lossy(&chunk));
-                // Check each line accumulated so far (strip \r so CRLF works too)
-                for raw_line in preamble.lines() {
-                    let line = raw_line.trim_end_matches('\r');
-                    if let Some(val) = line.strip_prefix("data: ") {
-                        session_id = Some(val.trim_end_matches('\r').to_string());
-                        return; // found what we need
-                    }
-                }
-            }
-        },
+        read_sse_session_id(&mut sse_stream),
     )
-    .await;
-    assert!(preamble_timeout.is_ok(), "Timed out waiting for SSE endpoint event");
+    .await
+    .expect("Timed out waiting for SSE endpoint event")
+    .expect("no sessionId in endpoint event");
 
-    let session_id = session_id.expect("no sessionId in endpoint event");
-
-    assert!(
-        !session_id.is_empty(),
-        "No sessionId received in SSE preamble. Got: {preamble}"
-    );
+    assert!(!session_id.is_empty(), "No sessionId received in SSE preamble");
 
     // 3. POST tools/list to /?sessionId=<id>
     let tools_list = serde_json::json!({
@@ -89,48 +99,17 @@ async fn test_tools_list_passthrough() {
         .send()
         .await
         .expect("POST failed");
-    assert!(
-        post_resp.status().is_success(),
-        "POST /?sessionId=... returned {}",
-        post_resp.status()
-    );
+    assert!(post_resp.status().is_success(), "POST /?sessionId=... returned {}", post_resp.status());
 
-    // 4. Read the "message" event from the SSE stream (response arrives here).
-    //    Burp does not send a \n\n terminator, so we accumulate lines and break
-    //    as soon as we have both an event: message line and a data: line in the
-    //    same event block (separated from the preamble by at least one blank /
-    //    non-data line).
-    let mut received = String::new();
-    let mut rpc_payload: Option<String> = None;
-
-    let timeout = tokio::time::timeout(
+    // 4. Read the "message" event from the SSE stream (response arrives here)
+    let payload = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        async {
-            let mut in_message_event = false;
-            while let Some(chunk) = sse_stream.next().await {
-                let chunk = chunk.expect("stream error");
-                let text = String::from_utf8_lossy(&chunk).to_string();
-                received.push_str(&text);
-                // Process newly arrived lines
-                for raw_line in text.lines() {
-                    let line = raw_line.trim_end_matches('\r');
-                    if line == "event: message" {
-                        in_message_event = true;
-                    } else if in_message_event {
-                        if let Some(d) = line.strip_prefix("data: ") {
-                            rpc_payload = Some(d.trim_end_matches('\r').to_string());
-                            return; // got what we need
-                        }
-                    }
-                }
-            }
-        },
+        read_sse_message_data(&mut sse_stream),
     )
-    .await;
-    assert!(timeout.is_ok(), "Timed out waiting for SSE response");
+    .await
+    .expect("Timed out waiting for SSE response")
+    .expect("No data line found in message event");
 
-    // Verify the payload is valid JSON-RPC (result or error)
-    let payload = rpc_payload.expect("No data line found in message event");
     let json: serde_json::Value = serde_json::from_str(&payload)
         .expect("SSE data is not valid JSON");
     assert!(
