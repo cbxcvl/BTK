@@ -9,6 +9,30 @@ fn is_empty_line(line: &str) -> bool {
     line.trim().is_empty()
 }
 
+/// Returns true if the request was a synthetic tool call and was handled locally (do not forward).
+async fn handle_tools_call(
+    request: &serde_json::Value,
+    cache: &Arc<SnapshotCache>,
+    inflight: &Arc<DashMap<u64, String>>,
+    config: &Arc<Config>,
+    stdout: &mut tokio::io::Stdout,
+) -> anyhow::Result<bool> {
+    let tool_name = request["params"]["name"].as_str().unwrap_or("").to_string();
+    if crate::synthetic::is_synthetic(&tool_name) {
+        let ttl = config.snapshot_ttl();
+        let response = crate::synthetic::handle(request, cache, ttl, config.body_max_chars);
+        let mut out = response.into_bytes();
+        out.push(b'\n');
+        stdout.write_all(&out).await?;
+        stdout.flush().await?;
+        return Ok(true);
+    }
+    if let Some(id) = request["id"].as_u64() {
+        inflight.insert(id, tool_name);
+    }
+    Ok(false)
+}
+
 pub async fn run(
     client: Arc<reqwest::Client>,
     session_rx: tokio::sync::watch::Receiver<Option<String>>,
@@ -39,21 +63,10 @@ pub async fn run(
 
         // Check if this is a synthetic tool call (btk_detail, btk_next_page)
         if let Ok(request) = serde_json::from_str::<serde_json::Value>(&line) {
-            if request["method"].as_str() == Some("tools/call") {
-                let tool_name = request["params"]["name"].as_str().unwrap_or("").to_string();
-                if crate::synthetic::is_synthetic(&tool_name) {
-                    let ttl = config.snapshot_ttl();
-                    let response = crate::synthetic::handle(&request, &cache, ttl, config.body_max_chars);
-                    let mut out = response.into_bytes();
-                    out.push(b'\n');
-                    stdout.write_all(&out).await?;
-                    stdout.flush().await?;
-                    continue; // Do NOT forward to Burp
-                }
-                // Track non-synthetic tools/call in inflight map for sse_task correlation
-                if let Some(id) = request["id"].as_u64() {
-                    inflight.insert(id, tool_name);
-                }
+            if request["method"].as_str() == Some("tools/call")
+                && handle_tools_call(&request, &cache, &inflight, &config, &mut stdout).await?
+            {
+                continue; // Do NOT forward to Burp
             }
         }
 
