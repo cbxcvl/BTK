@@ -57,10 +57,8 @@ impl Config {
             let content = std::fs::read_to_string(path)?;
             let toml_cfg: TomlConfig = toml::from_str(&content)?;
 
-            if let Some(tools) = toml_cfg.tools {
-                if let Some(allow) = tools.allow {
-                    config.allow = allow;
-                }
+            if let Some(allow) = toml_cfg.tools.and_then(|t| t.allow) {
+                config.allow = allow;
             }
 
             if let Some(tool_map) = toml_cfg.tool {
