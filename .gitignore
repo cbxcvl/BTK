@@ -1,6 +1,5 @@
 /target
 .worktrees/
-Cargo.lock
 out.txt
 .claude/
 docs/
