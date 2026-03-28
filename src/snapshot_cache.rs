@@ -42,7 +42,9 @@ impl SnapshotCache {
             size_bytes,
         };
 
-        self.entries.insert(id.clone(), snapshot);
+        if let Some(old) = self.entries.insert(id.clone(), snapshot) {
+            self.current_size_bytes.fetch_sub(old.size_bytes, Ordering::Relaxed);
+        }
         self.current_size_bytes.fetch_add(size_bytes, Ordering::Relaxed);
 
         {
