@@ -44,11 +44,15 @@ pub fn apply_to_body(body: &str, content_type: &str, max_chars: usize) -> String
         return body.to_string();
     }
 
-    // Plain text and everything else: char-level truncation
+    // Plain text and everything else: byte-level truncation at a valid UTF-8 boundary
     if body.len() <= max_chars {
         return body.to_string();
     }
-    body.chars().take(max_chars).collect()
+    let mut end = max_chars;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    body[..end].to_string()
 }
 
 fn truncate_json(body: &str, max_chars: usize) -> String {
@@ -70,14 +74,13 @@ fn truncate_json_value(v: &mut serde_json::Value, str_max: usize, arr_max: usize
             }
         }
         serde_json::Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                truncate_json_value(item, str_max, arr_max);
+            }
             if arr.len() > arr_max {
                 let n = arr.len();
                 arr.truncate(arr_max);
                 arr.push(serde_json::Value::String(format!("[…{} more]", n - arr_max)));
-            } else {
-                for item in arr.iter_mut() {
-                    truncate_json_value(item, str_max, arr_max);
-                }
             }
         }
         serde_json::Value::Object(map) => {
