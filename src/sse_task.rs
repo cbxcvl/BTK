@@ -7,6 +7,14 @@ use crate::config::Config;
 use crate::snapshot_cache::SnapshotCache;
 use dashmap::DashMap;
 
+struct SseContext<'a> {
+    config: &'a Arc<Config>,
+    compressor_config: &'a CompressorConfig,
+    cache: &'a Arc<SnapshotCache>,
+    inflight: &'a Arc<DashMap<u64, String>>,
+    session_tx: &'a tokio::sync::watch::Sender<Option<String>>,
+}
+
 pub(crate) fn backoff_secs(consecutive_failures: u32, max_secs: u64) -> u64 {
     let exp = 2u64.saturating_pow(consecutive_failures.saturating_sub(1));
     exp.min(max_secs)
@@ -44,13 +52,7 @@ pub async fn run(
     }
 }
 
-fn transform_message_data(
-    data: &str,
-    config: &Arc<Config>,
-    compressor_config: &CompressorConfig,
-    cache: &Arc<SnapshotCache>,
-    inflight: &Arc<DashMap<u64, String>>,
-) -> String {
+fn transform_message_data(data: &str, ctx: &SseContext<'_>) -> String {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) else {
         return data.to_string();
     };
@@ -58,12 +60,12 @@ fn transform_message_data(
     if value.pointer("/result/tools").and_then(|t| t.as_array()).is_some() {
         // tools/list response: compress descriptions + inject synthetic tools
         crate::lossless::strip(&mut value);
-        crate::compressor::transform(&mut value, compressor_config);
+        crate::compressor::transform(&mut value, ctx.compressor_config);
         crate::synthetic::inject_tools(&mut value);
     } else {
         // Look up originating tool name from inflight map
         let tool_name = value["id"].as_u64()
-            .and_then(|id| inflight.remove(&id).map(|(_, v)| v));
+            .and_then(|id| ctx.inflight.remove(&id).map(|(_, v)| v));
 
         // Normalize Burp's content[0].text → result.items (must precede lossless)
         if let Some(ref tname) = tool_name {
@@ -75,7 +77,7 @@ fn transform_message_data(
 
         let grouped = match tool_name.as_deref() {
             Some(tname) if crate::grouper::is_groupable(tname) => {
-                crate::grouper::process(&mut value, tname, cache, config)
+                crate::grouper::process(&mut value, tname, ctx.cache, ctx.config)
             }
             _ => false,
         };
@@ -84,7 +86,7 @@ fn transform_message_data(
             // Layer 2: body truncation on items array
             if let Some(items) = value.pointer_mut("/result/items").and_then(|v| v.as_array_mut()) {
                 for item in items.iter_mut() {
-                    crate::body_truncate::apply_to_item(item, config.body_max_chars);
+                    crate::body_truncate::apply_to_item(item, ctx.config.body_max_chars);
                 }
             }
         }
@@ -93,25 +95,17 @@ fn transform_message_data(
     serde_json::to_string(&value).unwrap_or_else(|_| data.to_string())
 }
 
-fn process_data_line(
-    data: &str,
-    event_type: &Option<String>,
-    config: &Arc<Config>,
-    compressor_config: &CompressorConfig,
-    cache: &Arc<SnapshotCache>,
-    inflight: &Arc<DashMap<u64, String>>,
-    session_tx: &tokio::sync::watch::Sender<Option<String>>,
-) -> Option<Vec<u8>> {
+fn process_data_line(data: &str, event_type: &Option<String>, ctx: &SseContext<'_>) -> Option<Vec<u8>> {
     match event_type.as_deref() {
         Some("endpoint") => {
-            let session_url = format!("{}{}", config.burp_url, data);
+            let session_url = format!("{}{}", ctx.config.burp_url, data);
             eprintln!("[btk] Got session URL: {session_url}");
-            let _ = session_tx.send(Some(session_url));
+            let _ = ctx.session_tx.send(Some(session_url));
             None
         }
         Some("message") | None => {
             // "message" is the explicit type, None means no event: line (default)
-            let output = transform_message_data(data, config, compressor_config, cache, inflight);
+            let output = transform_message_data(data, ctx);
             let mut out = output.into_bytes();
             out.push(b'\n');
             Some(out)
@@ -123,11 +117,7 @@ fn process_data_line(
 async fn process_line(
     line: &str,
     current_event_type: &mut Option<String>,
-    config: &Arc<Config>,
-    compressor_config: &CompressorConfig,
-    cache: &Arc<SnapshotCache>,
-    inflight: &Arc<DashMap<u64, String>>,
-    session_tx: &tokio::sync::watch::Sender<Option<String>>,
+    ctx: &SseContext<'_>,
     stdout: &mut tokio::io::Stdout,
 ) -> anyhow::Result<()> {
     if line.is_empty() {
@@ -142,7 +132,7 @@ async fn process_line(
     }
 
     if let Some(data) = line.strip_prefix("data: ") {
-        if let Some(out) = process_data_line(data, current_event_type, config, compressor_config, cache, inflight, session_tx) {
+        if let Some(out) = process_data_line(data, current_event_type, ctx) {
             stdout.write_all(&out).await?;
             stdout.flush().await?;
         }
@@ -176,6 +166,7 @@ async fn stream_sse(
     let mut stdout = tokio::io::stdout();
     let mut buf = Vec::<u8>::new();
     let mut current_event_type: Option<String> = None;
+    let ctx = SseContext { config, compressor_config, cache, inflight, session_tx };
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -197,7 +188,7 @@ async fn stream_sse(
                 }
             };
             buf.drain(..pos + 1);
-            process_line(&line, &mut current_event_type, config, compressor_config, cache, inflight, session_tx, &mut stdout).await?;
+            process_line(&line, &mut current_event_type, &ctx, &mut stdout).await?;
         }
     }
 
