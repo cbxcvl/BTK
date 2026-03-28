@@ -157,7 +157,7 @@ fn try_parse_java_http_response_response(text: &str) -> Option<Value> {
 
     // inner is now "httpRequest=<REQ>, httpResponse=<RESP>"
     let inner = inner.strip_prefix("httpRequest=")?;
-    let resp_pos = inner.find(", httpResponse=")?;
+    let resp_pos = inner.rfind(", httpResponse=")?;
     let req_raw = &inner[..resp_pos];
     let resp_raw = &inner[resp_pos + ", httpResponse=".len()..];
 
