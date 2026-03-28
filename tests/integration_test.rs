@@ -21,10 +21,12 @@ async fn read_sse_message_data(
     stream: &mut (impl StreamExt<Item = reqwest::Result<bytes::Bytes>> + Unpin),
 ) -> Option<String> {
     let mut in_message_event = false;
+    let mut buf = String::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.ok()?;
-        let text = String::from_utf8_lossy(&chunk).to_string();
-        for raw_line in text.lines() {
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(pos) = buf.find('\n') {
+            let raw_line = &buf[..pos];
             let line = raw_line.trim_end_matches('\r');
             if line == "event: message" {
                 in_message_event = true;
@@ -33,6 +35,7 @@ async fn read_sse_message_data(
                     return Some(d.trim_end_matches('\r').to_string());
                 }
             }
+            buf = buf[pos + 1..].to_string();
         }
     }
     None
