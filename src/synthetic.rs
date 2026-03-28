@@ -250,4 +250,167 @@ mod tests {
         assert!(text.contains("\"index\":20"), "cursor not applied: {text}");
         assert!(!text.contains("\"index\":19"), "pre-cursor item present: {text}");
     }
+
+    // ── is_synthetic ─────────────────────────────────────────────────────
+
+    #[test]
+    fn is_synthetic_true_for_btk_tools() {
+        assert!(is_synthetic("btk_detail"));
+        assert!(is_synthetic("btk_next_page"));
+    }
+
+    #[test]
+    fn is_synthetic_false_for_burp_tools() {
+        assert!(!is_synthetic("send_http1_request"));
+        assert!(!is_synthetic("get_proxy_http_history"));
+        assert!(!is_synthetic(""));
+    }
+
+    // ── btk_detail: additional scenarios ─────────────────────────────────
+
+    #[test]
+    fn handle_btk_detail_no_matches_returns_zero_items() {
+        let (cache, id) = make_cache_with_history();
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "tools/call",
+            "params": {"name": "btk_detail", "arguments": {"snapshot": id, "path": "DELETE /nonexistent"}}
+        });
+        let response_str = handle(&request, &cache, Duration::from_secs(600), 2000);
+        let response: serde_json::Value = serde_json::from_str(&response_str).unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("0 items"), "expected 0 items: {text}");
+    }
+
+    #[test]
+    fn handle_btk_detail_path_matching_is_case_insensitive() {
+        let (cache, id) = make_cache_with_history();
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "tools/call",
+            "params": {"name": "btk_detail", "arguments": {"snapshot": id, "path": "get /API/USERS"}}
+        });
+        let response_str = handle(&request, &cache, Duration::from_secs(600), 2000);
+        let response: serde_json::Value = serde_json::from_str(&response_str).unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("2 items"), "case-insensitive match failed: {text}");
+    }
+
+    #[test]
+    fn handle_btk_detail_scanner_mode_filters_by_issue_name() {
+        let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
+        let items = vec![
+            json!({"issueName": "SQL Injection", "severity": "high", "host": "example.com"}),
+            json!({"issueName": "SQL Injection", "severity": "high", "host": "other.com"}),
+            json!({"issueName": "CSRF", "severity": "medium", "host": "example.com"}),
+        ];
+        let id = cache.insert("sc", "get_scanner_issues".into(), items);
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "tools/call",
+            "params": {"name": "btk_detail", "arguments": {"snapshot": id, "path": "SQL Injection"}}
+        });
+        let response_str = handle(&request, &cache, Duration::from_secs(600), 2000);
+        let response: serde_json::Value = serde_json::from_str(&response_str).unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("2 items"), "expected 2 SQL Injection items: {text}");
+        assert!(!text.contains("CSRF"), "CSRF should be filtered out: {text}");
+    }
+
+    #[test]
+    fn handle_btk_detail_body_truncation_applied() {
+        let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
+        let long_body = "x".repeat(5000);
+        let items = vec![json!({
+            "request": {"method": "GET", "path": "/api", "headers": [], "body": ""},
+            "response": {
+                "statusCode": 200,
+                "headers": [{"name": "Content-Type", "value": "text/plain"}],
+                "body": long_body
+            }
+        })];
+        let id = cache.insert("ph", "get_proxy_http_history".into(), items);
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "tools/call",
+            "params": {"name": "btk_detail", "arguments": {"snapshot": id, "path": "GET /api"}}
+        });
+        let response_str = handle(&request, &cache, Duration::from_secs(600), 2000);
+        let response: serde_json::Value = serde_json::from_str(&response_str).unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        // Body in the JSON output should be truncated to <= 2000 chars
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(
+            text.lines().skip(1).collect::<Vec<_>>().join("\n").trim()
+        ).unwrap_or_default();
+        if let Some(body) = parsed.first().and_then(|i| i.pointer("/response/body")).and_then(|v| v.as_str()) {
+            assert!(body.len() <= 2000, "body not truncated: {} chars", body.len());
+        }
+    }
+
+    // ── btk_next_page: additional scenarios ──────────────────────────────
+
+    #[test]
+    fn handle_btk_next_page_cursor_zero_returns_first_page() {
+        let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
+        let items: Vec<serde_json::Value> = (0..25).map(|i| json!({"index": i})).collect();
+        let id = cache.insert("ph", "get_proxy_http_history".into(), items);
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "tools/call",
+            "params": {"name": "btk_next_page", "arguments": {"snapshot": id, "cursor": 0}}
+        });
+        let response_str = handle(&request, &cache, Duration::from_secs(600), 2000);
+        let response: serde_json::Value = serde_json::from_str(&response_str).unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"index\":0"), "first item missing: {text}");
+        assert!(text.contains("\"index\":19"), "last item of page missing: {text}");
+        assert!(!text.contains("\"index\":20"), "item beyond page size present: {text}");
+    }
+
+    #[test]
+    fn handle_btk_next_page_shows_remaining_hint_when_more_items() {
+        let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
+        let items: Vec<serde_json::Value> = (0..45).map(|i| json!({"index": i})).collect();
+        let id = cache.insert("ph", "get_proxy_http_history".into(), items);
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "tools/call",
+            "params": {"name": "btk_next_page", "arguments": {"snapshot": id, "cursor": 0}}
+        });
+        let response_str = handle(&request, &cache, Duration::from_secs(600), 2000);
+        let response: serde_json::Value = serde_json::from_str(&response_str).unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("btk_next_page"), "pagination hint missing: {text}");
+        assert!(text.contains("cursor=20"), "next cursor wrong: {text}");
+    }
+
+    #[test]
+    fn handle_btk_next_page_expired_snapshot_returns_error() {
+        let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "tools/call",
+            "params": {"name": "btk_next_page", "arguments": {"snapshot": "ph_expired", "cursor": 0}}
+        });
+        let response_str = handle(&request, &cache, Duration::from_secs(600), 2000);
+        let response: serde_json::Value = serde_json::from_str(&response_str).unwrap();
+        let is_error = response["result"]["isError"].as_bool().unwrap_or(false);
+        assert!(is_error, "expected isError=true for expired snapshot: {response}");
+    }
+
+    #[test]
+    fn handle_unknown_tool_returns_error() {
+        let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
+        let items = vec![json!({"x": 1})];
+        let id = cache.insert("ph", "get_proxy_http_history".into(), items);
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "tools/call",
+            "params": {"name": "btk_unknown", "arguments": {"snapshot": id, "path": ""}}
+        });
+        let response_str = handle(&request, &cache, Duration::from_secs(600), 2000);
+        let response: serde_json::Value = serde_json::from_str(&response_str).unwrap();
+        let is_error = response["result"]["isError"].as_bool().unwrap_or(false);
+        assert!(is_error, "expected isError=true for unknown tool: {response}");
+    }
 }

@@ -277,4 +277,125 @@ mod tests {
         assert!(summary.contains("200:2"), "missing 200 count: {summary}");
         assert!(summary.contains("403:1"), "missing 403 count: {summary}");
     }
+
+    // ── is_groupable ─────────────────────────────────────────────────────
+
+    #[test]
+    fn is_groupable_true_for_history_and_scanner_tools() {
+        assert!(is_groupable("get_proxy_http_history"));
+        assert!(is_groupable("get_proxy_http_history_regex"));
+        assert!(is_groupable("get_scanner_issues"));
+    }
+
+    #[test]
+    fn is_groupable_false_for_other_tools() {
+        assert!(!is_groupable("send_http1_request"));
+        assert!(!is_groupable("btk_detail"));
+        assert!(!is_groupable(""));
+    }
+
+    // ── history summarization ─────────────────────────────────────────────
+
+    #[test]
+    fn query_params_are_extracted_in_history_summary() {
+        let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
+        let config = make_config();
+        let mut value = make_history_response(vec![
+            make_history_item("GET", "/search?q=foo&page=1", 200),
+            make_history_item("GET", "/search?q=bar&page=2", 200),
+        ]);
+        process(&mut value, "get_proxy_http_history", &cache, &config);
+        let summary = value["result"].as_str().unwrap();
+        assert!(summary.contains("params:"), "no params section: {summary}");
+        assert!(summary.contains('q'), "param 'q' missing: {summary}");
+        assert!(summary.contains("page"), "param 'page' missing: {summary}");
+    }
+
+    #[test]
+    fn history_with_more_than_20_items_shows_pagination_hint() {
+        let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
+        let config = make_config();
+        let items: Vec<serde_json::Value> = (0..25)
+            .map(|i| make_history_item("GET", &format!("/api/item/{i}"), 200))
+            .collect();
+        let mut value = make_history_response(items);
+        process(&mut value, "get_proxy_http_history", &cache, &config);
+        let summary = value["result"].as_str().unwrap();
+        assert!(summary.contains("btk_next_page"), "pagination hint missing: {summary}");
+        assert!(summary.contains("cursor=20"), "cursor hint wrong: {summary}");
+    }
+
+    #[test]
+    fn history_summary_includes_btk_detail_hint() {
+        let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
+        let config = make_config();
+        let mut value = make_history_response(vec![
+            make_history_item("GET", "/api/users", 200),
+        ]);
+        process(&mut value, "get_proxy_http_history", &cache, &config);
+        let summary = value["result"].as_str().unwrap();
+        assert!(summary.contains("btk_detail"), "btk_detail hint missing: {summary}");
+        assert!(summary.contains("METHOD /path"), "path hint wrong: {summary}");
+    }
+
+    #[test]
+    fn get_proxy_http_history_regex_is_grouped() {
+        let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
+        let config = make_config();
+        let mut value = make_history_response(vec![
+            make_history_item("GET", "/api/users", 200),
+        ]);
+        let applied = process(&mut value, "get_proxy_http_history_regex", &cache, &config);
+        assert!(applied, "get_proxy_http_history_regex should be groupable");
+        let summary = value["result"].as_str().unwrap();
+        assert!(summary.contains("ph_"), "no snapshot id: {summary}");
+    }
+
+    #[test]
+    fn process_returns_false_for_empty_items_array() {
+        let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
+        let config = make_config();
+        let mut value = make_history_response(vec![]);
+        let original = value.clone();
+        let applied = process(&mut value, "get_proxy_http_history", &cache, &config);
+        assert!(!applied, "empty items should not be grouped");
+        assert_eq!(value, original);
+    }
+
+    // ── scanner summarization ─────────────────────────────────────────────
+
+    #[test]
+    fn scanner_summary_includes_btk_detail_hint() {
+        let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
+        let config = make_config();
+        let mut value = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "items": [make_scanner_item("high", "SQL Injection")] }
+        });
+        process(&mut value, "get_scanner_issues", &cache, &config);
+        let summary = value["result"].as_str().unwrap();
+        assert!(summary.contains("btk_detail"), "btk_detail hint missing: {summary}");
+        assert!(summary.contains("issue_type"), "issue_type hint missing: {summary}");
+    }
+
+    #[test]
+    fn scanner_summary_orders_by_severity() {
+        let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
+        let config = make_config();
+        let mut value = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "items": [
+                make_scanner_item("low", "Info Disclosure"),
+                make_scanner_item("critical", "RCE"),
+                make_scanner_item("high", "SQLi"),
+            ]}
+        });
+        process(&mut value, "get_scanner_issues", &cache, &config);
+        let summary = value["result"].as_str().unwrap();
+        let critical_pos = summary.find("Critical").unwrap_or(usize::MAX);
+        let high_pos = summary.find("High").unwrap_or(usize::MAX);
+        let low_pos = summary.find("Low").unwrap_or(usize::MAX);
+        assert!(critical_pos < high_pos, "Critical should come before High");
+        assert!(high_pos < low_pos, "High should come before Low");
+    }
 }
