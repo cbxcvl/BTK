@@ -1,5 +1,6 @@
 /target
 .worktrees/
 out.txt
+*.cdx.json
 .claude/
 docs/
