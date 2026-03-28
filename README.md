@@ -48,13 +48,11 @@ Real measurements. Same Burp instance. Same proxy history. Both sides measured d
 
 | Tool | Burp MCP Raw | BTK | Reduction | Ratio |
 |---|---|---|---|---|
-| `get_proxy_http_history` (10 items) | 42,185 B | 746 B | **98.2%** | 56× |
-| `get_proxy_http_history` (25 items) | 104,308 B | 1,973 B | **98.1%** | 52× |
-| `get_proxy_http_history` (50 items) | 185,364 B | 3,940 B | **97.9%** | 47× |
-| `get_scanner_issues` (10 issues) | 234,558 B | 227 B | **99.9%** | 1033× |
-| `tools/list` | 6,845 B | 6,496 B | 5.1% | ~1× |
+| `get_proxy_http_history` (10 items) | 42,379 B | 526 B | **98.8%** | 81× |
+| `get_scanner_issues` (10 issues) | 230,343 B | 280 B | **99.9%** | 823× |
+| `tools/list` | 6,837 B | 6,552 B | 4.2% | ~1× |
 
-> Scanner issues hit 1033× because the grouper collapses repeated issue types into a single summary line.
+> Scanner issues achieve 823× because the grouper collapses repeated issue types into a single summary line.
 
 ---
 
