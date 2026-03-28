@@ -46,7 +46,15 @@ fn collapse_cookies(item: &mut serde_json::Value, side: &str, header_name: &str)
     for header in headers.iter_mut() {
         if header["name"].as_str().unwrap_or("").eq_ignore_ascii_case(header_name) {
             let val = header["value"].as_str().unwrap_or("").to_string();
-            let cookies: Vec<&str> = val.split(';').map(|c| c.trim()).filter(|c| !c.is_empty()).collect();
+            let is_set_cookie = header_name.eq_ignore_ascii_case("Set-Cookie");
+            let cookies: Vec<&str> = if is_set_cookie {
+                val.split(';').next()
+                    .map(|c| c.trim())
+                    .filter(|c| !c.is_empty())
+                    .into_iter().collect()
+            } else {
+                val.split(';').map(|c| c.trim()).filter(|c| !c.is_empty()).collect()
+            };
             let count = cookies.len();
             let session = cookies.iter().find(|c| {
                 let name = c.split('=').next().unwrap_or("").to_lowercase();
