@@ -7,7 +7,7 @@ Reduces 182 KB tool responses to ~4 KB. No config. No workflow changes. Just fas
 
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-[![Status: Production](https://img.shields.io/badge/status-production-brightgreen?style=flat-square)]()
+![Status: Production](https://img.shields.io/badge/status-production-brightgreen?style=flat-square)
 
 </div>
 
