@@ -118,7 +118,7 @@ async fn process_line(
     line: &str,
     current_event_type: &mut Option<String>,
     ctx: &SseContext<'_>,
-    stdout: &mut tokio::io::Stdout,
+    out: &mut (impl tokio::io::AsyncWriteExt + Unpin),
 ) -> anyhow::Result<()> {
     if line.is_empty() {
         // blank line resets event state (standard SSE separator)
@@ -132,9 +132,9 @@ async fn process_line(
     }
 
     if let Some(data) = line.strip_prefix("data: ") {
-        if let Some(out) = process_data_line(data, current_event_type, ctx) {
-            stdout.write_all(&out).await?;
-            stdout.flush().await?;
+        if let Some(bytes) = process_data_line(data, current_event_type, ctx) {
+            out.write_all(&bytes).await?;
+            out.flush().await?;
         }
         *current_event_type = None;
     }
@@ -198,6 +198,238 @@ async fn stream_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn make_ctx<'a>(
+        config: &'a Arc<Config>,
+        compressor_config: &'a CompressorConfig,
+        cache: &'a Arc<SnapshotCache>,
+        inflight: &'a Arc<DashMap<u64, String>>,
+        session_tx: &'a tokio::sync::watch::Sender<Option<String>>,
+    ) -> SseContext<'a> {
+        SseContext { config, compressor_config, cache, inflight, session_tx }
+    }
+
+    fn default_config() -> Arc<Config> {
+        Arc::new(Config {
+            burp_url: "http://test.local".to_string(),
+            reconnect_max_secs: 30,
+            tools_config: None,
+            tools: None,
+            body_max_chars: 2000,
+            snapshot_ttl_secs: 600,
+            snapshot_max_mb: 50,
+        })
+    }
+
+    fn default_cache() -> Arc<SnapshotCache> {
+        Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)))
+    }
+
+    // ── process_data_line ────────────────────────────────────────────────
+
+    #[test]
+    fn data_line_endpoint_sends_session_url_and_returns_none() {
+        let config = default_config();
+        let compressor_config = CompressorConfig::default();
+        let cache = default_cache();
+        let inflight: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+        let (session_tx, session_rx) = tokio::sync::watch::channel(None);
+        let ctx = make_ctx(&config, &compressor_config, &cache, &inflight, &session_tx);
+
+        let result = process_data_line("/sse/session-123", &Some("endpoint".to_string()), &ctx);
+
+        assert!(result.is_none());
+        assert_eq!(
+            session_rx.borrow().as_deref(),
+            Some("http://test.local/sse/session-123")
+        );
+    }
+
+    #[test]
+    fn data_line_message_event_returns_json_bytes_ending_with_newline() {
+        let config = default_config();
+        let compressor_config = CompressorConfig::default();
+        let cache = default_cache();
+        let inflight: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+        let (session_tx, _) = tokio::sync::watch::channel(None);
+        let ctx = make_ctx(&config, &compressor_config, &cache, &inflight, &session_tx);
+
+        let data = r#"{"id":1,"jsonrpc":"2.0","result":{"content":[{"text":"hello","type":"text"}],"isError":false}}"#;
+        let result = process_data_line(data, &Some("message".to_string()), &ctx);
+
+        let bytes = result.expect("expected Some bytes");
+        assert!(*bytes.last().unwrap() == b'\n');
+        assert!(serde_json::from_slice::<serde_json::Value>(&bytes[..bytes.len() - 1]).is_ok());
+    }
+
+    #[test]
+    fn data_line_none_event_type_treated_as_message() {
+        let config = default_config();
+        let compressor_config = CompressorConfig::default();
+        let cache = default_cache();
+        let inflight: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+        let (session_tx, _) = tokio::sync::watch::channel(None);
+        let ctx = make_ctx(&config, &compressor_config, &cache, &inflight, &session_tx);
+
+        let data = r#"{"id":1,"jsonrpc":"2.0","result":{}}"#;
+        let result = process_data_line(data, &None, &ctx);
+
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn data_line_unknown_event_type_returns_none() {
+        let config = default_config();
+        let compressor_config = CompressorConfig::default();
+        let cache = default_cache();
+        let inflight: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+        let (session_tx, _) = tokio::sync::watch::channel(None);
+        let ctx = make_ctx(&config, &compressor_config, &cache, &inflight, &session_tx);
+
+        let result = process_data_line("anything", &Some("ping".to_string()), &ctx);
+
+        assert!(result.is_none());
+    }
+
+    // ── transform_message_data ───────────────────────────────────────────
+
+    #[test]
+    fn invalid_json_passes_through_unchanged() {
+        let config = default_config();
+        let compressor_config = CompressorConfig::default();
+        let cache = default_cache();
+        let inflight: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+        let (session_tx, _) = tokio::sync::watch::channel(None);
+        let ctx = make_ctx(&config, &compressor_config, &cache, &inflight, &session_tx);
+
+        let result = transform_message_data("not valid json", &ctx);
+        assert_eq!(result, "not valid json");
+    }
+
+    #[test]
+    fn tools_list_response_has_descriptions_compressed() {
+        let config = default_config();
+        let compressor_config = CompressorConfig::default();
+        let cache = default_cache();
+        let inflight: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+        let (session_tx, _) = tokio::sync::watch::channel(None);
+        let ctx = make_ctx(&config, &compressor_config, &cache, &inflight, &session_tx);
+
+        let data = r#"{"id":1,"jsonrpc":"2.0","result":{"tools":[{"name":"send_http1_request","description":"Some very long original description that should be replaced by the builtin short one"}]}}"#;
+        let result = transform_message_data(data, &ctx);
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let desc = v.pointer("/result/tools/0/description").and_then(|d| d.as_str()).unwrap();
+        assert!(desc.len() < 60, "description should be compressed, got: {desc}");
+    }
+
+    #[test]
+    fn message_response_strips_null_fields_and_meta_at_result_level() {
+        let config = default_config();
+        let compressor_config = CompressorConfig::default();
+        let cache = default_cache();
+        let inflight: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+        let (session_tx, _) = tokio::sync::watch::channel(None);
+        let ctx = make_ctx(&config, &compressor_config, &cache, &inflight, &session_tx);
+
+        // lossless::strip removes null fields and _meta at the result level
+        let data = r#"{"id":1,"jsonrpc":"2.0","result":{"items":[],"_meta":null,"nullField":null,"keepMe":"value"}}"#;
+        let result = transform_message_data(data, &ctx);
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(v.pointer("/result/_meta").is_none(), "_meta should be stripped");
+        assert!(v.pointer("/result/nullField").is_none(), "null fields should be stripped from result");
+        assert_eq!(v.pointer("/result/keepMe").and_then(|v| v.as_str()), Some("value"), "non-null fields should be preserved");
+    }
+
+    #[test]
+    fn inflight_tool_name_is_consumed_on_response() {
+        let config = default_config();
+        let compressor_config = CompressorConfig::default();
+        let cache = default_cache();
+        let inflight: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+        inflight.insert(42, "get_proxy_http_history".to_string());
+        let (session_tx, _) = tokio::sync::watch::channel(None);
+        let ctx = make_ctx(&config, &compressor_config, &cache, &inflight, &session_tx);
+
+        let data = r#"{"id":42,"jsonrpc":"2.0","result":{"content":[{"text":"{}","type":"text"}],"isError":false}}"#;
+        transform_message_data(data, &ctx);
+
+        assert!(!inflight.contains_key(&42), "inflight entry should be consumed");
+    }
+
+    // ── process_line ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn blank_line_resets_event_type() {
+        let config = default_config();
+        let compressor_config = CompressorConfig::default();
+        let cache = default_cache();
+        let inflight: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+        let (session_tx, _) = tokio::sync::watch::channel(None);
+        let ctx = make_ctx(&config, &compressor_config, &cache, &inflight, &session_tx);
+        let mut out = Vec::<u8>::new();
+        let mut event_type = Some("message".to_string());
+
+        process_line("", &mut event_type, &ctx, &mut out).await.unwrap();
+
+        assert!(event_type.is_none());
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn event_line_sets_current_event_type() {
+        let config = default_config();
+        let compressor_config = CompressorConfig::default();
+        let cache = default_cache();
+        let inflight: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+        let (session_tx, _) = tokio::sync::watch::channel(None);
+        let ctx = make_ctx(&config, &compressor_config, &cache, &inflight, &session_tx);
+        let mut out = Vec::<u8>::new();
+        let mut event_type = None;
+
+        process_line("event: message", &mut event_type, &ctx, &mut out).await.unwrap();
+
+        assert_eq!(event_type.as_deref(), Some("message"));
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn data_line_writes_output_and_resets_event_type() {
+        let config = default_config();
+        let compressor_config = CompressorConfig::default();
+        let cache = default_cache();
+        let inflight: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+        let (session_tx, _) = tokio::sync::watch::channel(None);
+        let ctx = make_ctx(&config, &compressor_config, &cache, &inflight, &session_tx);
+        let mut out = Vec::<u8>::new();
+        let mut event_type = Some("message".to_string());
+
+        let data = r#"data: {"id":1,"jsonrpc":"2.0","result":{}}"#;
+        process_line(data, &mut event_type, &ctx, &mut out).await.unwrap();
+
+        assert!(event_type.is_none(), "event type should be reset after data line");
+        assert!(!out.is_empty(), "output should be written");
+        assert_eq!(*out.last().unwrap(), b'\n');
+    }
+
+    #[tokio::test]
+    async fn endpoint_data_line_sends_session_url_no_output() {
+        let config = default_config();
+        let compressor_config = CompressorConfig::default();
+        let cache = default_cache();
+        let inflight: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+        let (session_tx, session_rx) = tokio::sync::watch::channel(None);
+        let ctx = make_ctx(&config, &compressor_config, &cache, &inflight, &session_tx);
+        let mut out = Vec::<u8>::new();
+        let mut event_type = Some("endpoint".to_string());
+
+        process_line("data: /sse/abc", &mut event_type, &ctx, &mut out).await.unwrap();
+
+        assert!(out.is_empty(), "endpoint data should not be written to output");
+        assert_eq!(session_rx.borrow().as_deref(), Some("http://test.local/sse/abc"));
+    }
+
+    // ── backoff_secs ─────────────────────────────────────────────────────
 
     #[test]
     fn backoff_grows_exponentially_and_caps() {
