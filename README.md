@@ -110,6 +110,14 @@ A full pentest session — recon, active scanning, manual testing, reporting —
 
 ## Installation
 
+**Arch Linux (AUR):**
+
+```bash
+yay -S btk-bin
+```
+
+**Via Cargo:**
+
 ```bash
 cargo install --git https://github.com/cbxcvl/BTK
 ```
