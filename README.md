@@ -88,7 +88,7 @@ BTK injects two extra tools into `tools/list` that Claude can use to navigate co
 
 ## Usage with RTK
 
-BTK pairs naturally with **[RTK (Rust Token Killer)](https://github.com/rtk-ai/rtk)** — the CLI proxy that compresses `git`, `cargo`, `npm`, and other dev tool output before it reaches your LLM.
+BTK pairs naturally with **[RTK (Real Token Killer)](https://github.com/rtk-ai/rtk)** — the CLI proxy that compresses `git`, `cargo`, `npm`, and other dev tool output before it reaches your LLM.
 
 Together they cover the two sides of a security workflow:
 
