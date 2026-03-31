@@ -56,6 +56,12 @@ fn is_plain_json_tool(tool: &str) -> bool {
     matches!(tool, "output_project_options" | "output_user_options")
 }
 
+/// Returns true if this tool's response should be normalized (content[0].text → result.items).
+/// Tools not listed here pass through unchanged, preserving their original content[0].text.
+pub fn needs_normalization(tool_name: &str) -> bool {
+    is_multi_item_history(tool_name) || is_single_response_tool(tool_name) || is_plain_json_tool(tool_name)
+}
+
 fn build_history_items(text: &str) -> Vec<Value> {
     text.lines()
         .filter(|l| !l.trim().is_empty())
@@ -193,6 +199,35 @@ fn headers_to_json(headers: &[http_parse::HttpHeader]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn needs_normalization_true_for_known_tools() {
+        assert!(needs_normalization("get_proxy_http_history"));
+        assert!(needs_normalization("get_proxy_http_history_regex"));
+        assert!(needs_normalization("get_proxy_websocket_history"));
+        assert!(needs_normalization("get_proxy_websocket_history_regex"));
+        assert!(needs_normalization("get_scanner_issues"));
+        assert!(needs_normalization("send_http1_request"));
+        assert!(needs_normalization("send_http2_request"));
+        assert!(needs_normalization("get_active_editor_contents"));
+        assert!(needs_normalization("output_project_options"));
+        assert!(needs_normalization("output_user_options"));
+    }
+
+    #[test]
+    fn needs_normalization_false_for_passthrough_tools() {
+        assert!(!needs_normalization("base64_encode"));
+        assert!(!needs_normalization("base64_decode"));
+        assert!(!needs_normalization("url_encode"));
+        assert!(!needs_normalization("url_decode"));
+        assert!(!needs_normalization("generate_random_string"));
+        assert!(!needs_normalization("generate_collaborator_payload"));
+        assert!(!needs_normalization("set_proxy_intercept_state"));
+        assert!(!needs_normalization("set_task_execution_engine_state"));
+        assert!(!needs_normalization("create_repeater_tab"));
+        assert!(!needs_normalization("send_to_intruder"));
+        assert!(!needs_normalization(""));
+    }
 
     fn make_content_response(text: &str) -> Value {
         json!({
