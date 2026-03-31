@@ -66,9 +66,13 @@ fn transform_message_data(data: &str, ctx: &SseContext<'_>) -> String {
         let tool_name = value["id"].as_u64()
             .and_then(|id| ctx.inflight.remove(&id).map(|(_, v)| v));
 
-        // Normalize Burp's content[0].text → result.items (must precede lossless)
+        // Normalize Burp's content[0].text → result.items (must precede lossless).
+        // Only run for tools that actually benefit from normalization; all others pass
+        // through unchanged so their original content[0].text reaches the MCP client.
         if let Some(ref tname) = tool_name {
-            crate::normalizer::normalize_response(&mut value, tname);
+            if crate::normalizer::needs_normalization(tname) {
+                crate::normalizer::normalize_response(&mut value, tname);
+            }
         }
 
         // Layer 1: lossless strip (now result.items exists if normalization ran)
@@ -86,6 +90,22 @@ fn transform_message_data(data: &str, ctx: &SseContext<'_>) -> String {
             if let Some(items) = value.pointer_mut("/result/items").and_then(|v| v.as_array_mut()) {
                 for item in items.iter_mut() {
                     crate::body_truncate::apply_to_item(item, ctx.config.body_max_chars);
+                }
+            }
+            // Re-wrap result.items as content[0].text for MCP compliance.
+            // This applies to normalizable-but-not-groupable tools (e.g. send_http1_request,
+            // output_user_options) whose items array was built by the normalizer.
+            if let Some(items) = value.pointer("/result/items").and_then(|v| v.as_array()) {
+                if !items.is_empty() {
+                    let text = if items.len() == 1 {
+                        serde_json::to_string_pretty(&items[0]).unwrap_or_default()
+                    } else {
+                        serde_json::to_string_pretty(&serde_json::Value::Array(items.to_vec()))
+                            .unwrap_or_default()
+                    };
+                    value["result"] = serde_json::json!({
+                        "content": [{"type": "text", "text": text}]
+                    });
                 }
             }
         }
@@ -338,6 +358,52 @@ mod tests {
         assert!(v.pointer("/result/_meta").is_none(), "_meta should be stripped");
         assert!(v.pointer("/result/nullField").is_none(), "null fields should be stripped from result");
         assert_eq!(v.pointer("/result/keepMe").and_then(|v| v.as_str()), Some("value"), "non-null fields should be preserved");
+    }
+
+    #[test]
+    fn unknown_tool_content_passes_through_unchanged() {
+        // Tools not in needs_normalization (e.g. base64_encode, url_encode) must preserve
+        // the original content[0].text so the MCP client can display it.
+        let config = default_config();
+        let compressor_config = CompressorConfig::default();
+        let cache = default_cache();
+        let inflight: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+        inflight.insert(7, "base64_encode".to_string());
+        let (session_tx, _) = tokio::sync::watch::channel(None);
+        let ctx = make_ctx(&config, &compressor_config, &cache, &inflight, &session_tx);
+
+        let data = r#"{"id":7,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"aGVsbG8="}],"isError":false}}"#;
+        let result = transform_message_data(data, &ctx);
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let text = v.pointer("/result/content/0/text").and_then(|t| t.as_str())
+            .expect("content[0].text should be preserved for unknown tools");
+        assert_eq!(text, "aGVsbG8=", "base64 output should pass through verbatim");
+        assert!(v.pointer("/result/items").is_none(), "result.items must not appear for unknown tools");
+    }
+
+    #[test]
+    fn single_response_tool_items_rewrapped_as_content() {
+        // send_http1_request is normalizable but not groupable: after normalization +
+        // body_truncate the items should be re-wrapped as content[0].text.
+        let config = default_config();
+        let compressor_config = CompressorConfig::default();
+        let cache = default_cache();
+        let inflight: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+        inflight.insert(8, "send_http1_request".to_string());
+        let (session_tx, _) = tokio::sync::watch::channel(None);
+        let ctx = make_ctx(&config, &compressor_config, &cache, &inflight, &session_tx);
+
+        let raw_response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhello";
+        let data = format!(
+            r#"{{"id":8,"jsonrpc":"2.0","result":{{"content":[{{"type":"text","text":"{raw_response}"}}],"isError":false}}}}"#,
+            raw_response = raw_response.replace("\r\n", "\\r\\n")
+        );
+        let result = transform_message_data(&data, &ctx);
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let text = v.pointer("/result/content/0/text").and_then(|t| t.as_str())
+            .expect("content[0].text should be present after re-wrap");
+        assert!(text.contains("200"), "re-wrapped content should include status code: {text}");
+        assert!(v.pointer("/result/items").is_none(), "result.items must not appear after re-wrap");
     }
 
     #[test]
