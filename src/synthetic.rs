@@ -102,25 +102,32 @@ pub fn handle(
         }
         "btk_next_page" => {
             let cursor = args["cursor"].as_u64().unwrap_or(0) as usize;
+            let total = snapshot.raw_items.len();
             let page: Vec<serde_json::Value> = snapshot.raw_items.iter()
                 .skip(cursor)
                 .take(PAGE_SIZE)
-                .map(|item| {
-                    let mut item = item.clone();
-                    crate::body_truncate::apply_to_item(&mut item, body_max_chars);
-                    item
-                })
+                .cloned()
                 .collect();
-            let remaining = snapshot.raw_items.len().saturating_sub(cursor + PAGE_SIZE);
-            let mut text = format!("Items {}-{} of {}:\n{}",
-                cursor + 1,
-                cursor + page.len(),
-                snapshot.raw_items.len(),
-                serde_json::to_string(&serde_json::Value::Array(page)).unwrap_or_default()
-            );
+            let page_end = cursor + page.len();
+            let is_scanner = snapshot.tool_name.contains("scanner");
+            let summary = if is_scanner {
+                crate::grouper::summarize_scanner(&page)
+            } else {
+                crate::grouper::summarize_history(&page)
+            };
+            let mut text = format!("BTK snapshot {snapshot_id} items {}-{} of {total}:\n{summary}",
+                cursor + 1, page_end);
+            let remaining = total.saturating_sub(page_end);
             if remaining > 0 {
-                text.push_str(&format!("\n[{remaining} more items — use btk_next_page(snapshot=\"{snapshot_id}\", cursor={})]", cursor + PAGE_SIZE));
+                text.push_str(&format!("\nUse btk_next_page(snapshot=\"{snapshot_id}\", cursor={page_end}) for items {}-{}.",
+                    page_end + 1, total));
             }
+            let detail_hint = if is_scanner {
+                format!("\nUse btk_detail(snapshot=\"{snapshot_id}\", path=\"<issue_type>\") to expand an issue type.")
+            } else {
+                format!("\nUse btk_detail(snapshot=\"{snapshot_id}\", path=\"<METHOD /path>\") to expand a path.")
+            };
+            text.push_str(&detail_hint);
             text
         }
         _ => return json_rpc_error(&id, "unknown synthetic tool"),
@@ -237,7 +244,10 @@ mod tests {
     #[test]
     fn handle_btk_next_page_returns_slice() {
         let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
-        let items: Vec<serde_json::Value> = (0..25).map(|i| json!({"index": i})).collect();
+        let mk = |path: &str| json!({"request": {"method": "GET", "path": path, "headers": [], "body": ""},
+                                     "response": {"statusCode": 200, "headers": [], "body": ""}});
+        let mut items: Vec<serde_json::Value> = (0..20).map(|_| mk("/early")).collect();
+        items.extend((0..5).map(|_| mk("/late")));
         let id = cache.insert("ph", "get_proxy_http_history".into(), items);
         let request = json!({
             "jsonrpc": "2.0", "id": 2,
@@ -247,8 +257,9 @@ mod tests {
         let response_str = handle(&request, &cache, Duration::from_secs(600), 2000);
         let response: serde_json::Value = serde_json::from_str(&response_str).unwrap();
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("\"index\":20"), "cursor not applied: {text}");
-        assert!(!text.contains("\"index\":19"), "pre-cursor item present: {text}");
+        assert!(text.contains("items 21-25 of 25"), "cursor not applied: {text}");
+        assert!(text.contains("/late"), "expected /late path in slice: {text}");
+        assert!(!text.contains("/early"), "pre-cursor /early path present: {text}");
     }
 
     // ── is_synthetic ─────────────────────────────────────────────────────
@@ -352,7 +363,10 @@ mod tests {
     #[test]
     fn handle_btk_next_page_cursor_zero_returns_first_page() {
         let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
-        let items: Vec<serde_json::Value> = (0..25).map(|i| json!({"index": i})).collect();
+        let mk = |path: &str| json!({"request": {"method": "GET", "path": path, "headers": [], "body": ""},
+                                     "response": {"statusCode": 200, "headers": [], "body": ""}});
+        let mut items: Vec<serde_json::Value> = (0..20).map(|_| mk("/early")).collect();
+        items.extend((0..5).map(|_| mk("/late")));
         let id = cache.insert("ph", "get_proxy_http_history".into(), items);
         let request = json!({
             "jsonrpc": "2.0", "id": 1,
@@ -362,9 +376,9 @@ mod tests {
         let response_str = handle(&request, &cache, Duration::from_secs(600), 2000);
         let response: serde_json::Value = serde_json::from_str(&response_str).unwrap();
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("\"index\":0"), "first item missing: {text}");
-        assert!(text.contains("\"index\":19"), "last item of page missing: {text}");
-        assert!(!text.contains("\"index\":20"), "item beyond page size present: {text}");
+        assert!(text.contains("items 1-20 of 25"), "range header wrong: {text}");
+        assert!(text.contains("/early"), "first page items missing: {text}");
+        assert!(!text.contains("/late"), "item beyond page size present: {text}");
     }
 
     #[test]
@@ -396,6 +410,70 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(&response_str).unwrap();
         let is_error = response["result"]["isError"].as_bool().unwrap_or(false);
         assert!(is_error, "expected isError=true for expired snapshot: {response}");
+    }
+
+    #[test]
+    fn handle_btk_next_page_scanner_snapshot_uses_scanner_summary() {
+        let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
+        let mk = |name: &str| json!({"issueName": name, "severity": "high", "url": "https://example.com"});
+        let mut items: Vec<serde_json::Value> = (0..20).map(|_| mk("SQL Injection")).collect();
+        items.extend((0..5).map(|_| mk("CSRF")));
+        let id = cache.insert("sc", "get_scanner_issues".into(), items);
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "tools/call",
+            "params": {"name": "btk_next_page", "arguments": {"snapshot": id, "cursor": 20}}
+        });
+        let response_str = handle(&request, &cache, Duration::from_secs(600), 2000);
+        let response: serde_json::Value = serde_json::from_str(&response_str).unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("items 21-25 of 25"), "range header wrong: {text}");
+        assert!(text.contains("CSRF"), "expected CSRF in scanner page: {text}");
+        assert!(!text.contains("SQL Injection"), "pre-cursor issue present: {text}");
+        assert!(text.contains("btk_detail"), "scanner detail hint missing: {text}");
+        assert!(text.contains("issue_type"), "scanner detail hint wrong format: {text}");
+    }
+
+    #[test]
+    fn handle_btk_next_page_last_page_no_continuation_hint() {
+        let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
+        let mk = |path: &str| json!({"request": {"method": "GET", "path": path, "headers": [], "body": ""},
+                                     "response": {"statusCode": 200, "headers": [], "body": ""}});
+        let items: Vec<serde_json::Value> = (0..5).map(|_| mk("/api")).collect();
+        let id = cache.insert("ph", "get_proxy_http_history".into(), items);
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "tools/call",
+            "params": {"name": "btk_next_page", "arguments": {"snapshot": id, "cursor": 0}}
+        });
+        let response_str = handle(&request, &cache, Duration::from_secs(600), 2000);
+        let response: serde_json::Value = serde_json::from_str(&response_str).unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("items 1-5 of 5"), "range wrong: {text}");
+        // Only the btk_detail hint should appear, not a next-page continuation
+        let next_page_count = text.matches("cursor=").count();
+        assert_eq!(next_page_count, 0, "no cursor hint expected on last page: {text}");
+    }
+
+    #[test]
+    fn handle_btk_detail_query_string_stripped_in_path_match() {
+        let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
+        let items = vec![
+            json!({"request": {"method": "GET", "path": "/api/users?id=1", "headers": [], "body": ""},
+                   "response": {"statusCode": 200, "headers": [], "body": ""}}),
+            json!({"request": {"method": "GET", "path": "/api/users?id=2", "headers": [], "body": ""},
+                   "response": {"statusCode": 200, "headers": [], "body": ""}}),
+        ];
+        let id = cache.insert("ph", "get_proxy_http_history".into(), items);
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "tools/call",
+            "params": {"name": "btk_detail", "arguments": {"snapshot": id, "path": "GET /api/users"}}
+        });
+        let response_str = handle(&request, &cache, Duration::from_secs(600), 2000);
+        let response: serde_json::Value = serde_json::from_str(&response_str).unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("2 items"), "query string not stripped in path match: {text}");
     }
 
     #[test]
