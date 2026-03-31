@@ -59,11 +59,14 @@ pub fn process(
     };
     full_summary.push_str(&detail_hint);
 
-    value["result"] = serde_json::Value::String(full_summary);
+    value["result"] = serde_json::json!({
+        "content": [{"type": "text", "text": full_summary}],
+        "isError": false
+    });
     true
 }
 
-fn summarize_history(items: &[serde_json::Value]) -> String {
+pub fn summarize_history(items: &[serde_json::Value]) -> String {
     use std::collections::HashMap;
 
     let mut groups: std::collections::BTreeMap<String, (Vec<String>, HashMap<u16, u32>)> =
@@ -103,7 +106,7 @@ fn summarize_history(items: &[serde_json::Value]) -> String {
     lines.join("\n")
 }
 
-fn summarize_scanner(items: &[serde_json::Value]) -> String {
+pub fn summarize_scanner(items: &[serde_json::Value]) -> String {
     use std::collections::HashMap;
 
     let severity_order = ["critical", "high", "medium", "low", "info"];
@@ -193,8 +196,8 @@ mod tests {
         let applied = process(&mut value, "get_proxy_http_history", &cache, &config);
         assert!(applied);
         let result = &value["result"];
-        assert!(result.is_string(), "expected string summary, got: {result}");
-        let summary = result.as_str().unwrap();
+        assert!(result["content"][0]["text"].is_string(), "expected MCP content text, got: {result}");
+        let summary = result["content"][0]["text"].as_str().unwrap();
         assert!(summary.contains("ph_"), "no snapshot id: {summary}");
         assert!(summary.contains("GET /api/users"), "no path grouping: {summary}");
         assert!(summary.contains("POST /api/login"), "missing login: {summary}");
@@ -208,7 +211,7 @@ mod tests {
             make_history_item("GET", "/api/users", 200),
         ]);
         process(&mut value, "get_proxy_http_history", &cache, &config);
-        let summary = value["result"].as_str().unwrap();
+        let summary = value["result"]["content"][0]["text"].as_str().unwrap();
         // The summary starts with "BTK proxy history snapshot ph_XXXXXXXX ("
         // Split on ' ' and find the token starting with "ph_"
         let snap_id = summary.split(' ')
@@ -243,7 +246,7 @@ mod tests {
         });
         let applied = process(&mut value, "get_scanner_issues", &cache, &config);
         assert!(applied);
-        let summary = value["result"].as_str().unwrap();
+        let summary = value["result"]["content"][0]["text"].as_str().unwrap();
         assert!(summary.contains("sc_"), "no scanner snapshot id: {summary}");
         assert!(summary.contains("BTK scanner snapshot"), "wrong header: {summary}");
         assert!(summary.contains("Critical"), "missing critical: {summary}");
@@ -273,7 +276,7 @@ mod tests {
             make_history_item("GET", "/api/users", 403),
         ]);
         process(&mut value, "get_proxy_http_history", &cache, &config);
-        let summary = value["result"].as_str().unwrap();
+        let summary = value["result"]["content"][0]["text"].as_str().unwrap();
         assert!(summary.contains("200:2"), "missing 200 count: {summary}");
         assert!(summary.contains("403:1"), "missing 403 count: {summary}");
     }
@@ -305,7 +308,7 @@ mod tests {
             make_history_item("GET", "/search?q=bar&page=2", 200),
         ]);
         process(&mut value, "get_proxy_http_history", &cache, &config);
-        let summary = value["result"].as_str().unwrap();
+        let summary = value["result"]["content"][0]["text"].as_str().unwrap();
         assert!(summary.contains("params:"), "no params section: {summary}");
         assert!(summary.contains('q'), "param 'q' missing: {summary}");
         assert!(summary.contains("page"), "param 'page' missing: {summary}");
@@ -320,7 +323,7 @@ mod tests {
             .collect();
         let mut value = make_history_response(items);
         process(&mut value, "get_proxy_http_history", &cache, &config);
-        let summary = value["result"].as_str().unwrap();
+        let summary = value["result"]["content"][0]["text"].as_str().unwrap();
         assert!(summary.contains("btk_next_page"), "pagination hint missing: {summary}");
         assert!(summary.contains("cursor=20"), "cursor hint wrong: {summary}");
     }
@@ -333,7 +336,7 @@ mod tests {
             make_history_item("GET", "/api/users", 200),
         ]);
         process(&mut value, "get_proxy_http_history", &cache, &config);
-        let summary = value["result"].as_str().unwrap();
+        let summary = value["result"]["content"][0]["text"].as_str().unwrap();
         assert!(summary.contains("btk_detail"), "btk_detail hint missing: {summary}");
         assert!(summary.contains("METHOD /path"), "path hint wrong: {summary}");
     }
@@ -347,7 +350,7 @@ mod tests {
         ]);
         let applied = process(&mut value, "get_proxy_http_history_regex", &cache, &config);
         assert!(applied, "get_proxy_http_history_regex should be groupable");
-        let summary = value["result"].as_str().unwrap();
+        let summary = value["result"]["content"][0]["text"].as_str().unwrap();
         assert!(summary.contains("ph_"), "no snapshot id: {summary}");
     }
 
@@ -373,9 +376,26 @@ mod tests {
             "result": { "items": [make_scanner_item("high", "SQL Injection")] }
         });
         process(&mut value, "get_scanner_issues", &cache, &config);
-        let summary = value["result"].as_str().unwrap();
+        let summary = value["result"]["content"][0]["text"].as_str().unwrap();
         assert!(summary.contains("btk_detail"), "btk_detail hint missing: {summary}");
         assert!(summary.contains("issue_type"), "issue_type hint missing: {summary}");
+    }
+
+    #[test]
+    fn scanner_with_more_than_20_items_shows_pagination_hint() {
+        let cache = Arc::new(SnapshotCache::new(50 * 1024 * 1024, Duration::from_secs(600)));
+        let config = make_config();
+        let items: Vec<serde_json::Value> = (0..25)
+            .map(|_| make_scanner_item("high", "SQL Injection"))
+            .collect();
+        let mut value = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "items": items }
+        });
+        process(&mut value, "get_scanner_issues", &cache, &config);
+        let summary = value["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(summary.contains("btk_next_page"), "pagination hint missing for scanner: {summary}");
+        assert!(summary.contains("cursor=20"), "cursor hint wrong: {summary}");
     }
 
     #[test]
@@ -391,7 +411,7 @@ mod tests {
             ]}
         });
         process(&mut value, "get_scanner_issues", &cache, &config);
-        let summary = value["result"].as_str().unwrap();
+        let summary = value["result"]["content"][0]["text"].as_str().unwrap();
         let critical_pos = summary.find("Critical").unwrap_or(usize::MAX);
         let high_pos = summary.find("High").unwrap_or(usize::MAX);
         let low_pos = summary.find("Low").unwrap_or(usize::MAX);
