@@ -88,7 +88,7 @@ BTK injects two extra tools into `tools/list` that Claude can use to navigate co
 
 ## Usage with RTK
 
-BTK pairs naturally with **[RTK (Real Token Killer)](https://github.com/rtk-ai/rtk)** — the CLI proxy that compresses `git`, `cargo`, `npm`, and other dev tool output before it reaches your LLM.
+BTK pairs naturally with **[RTK (Real Token Killer)](https://github.com/reachingforthejack/rtk)** — the CLI proxy that compresses `git`, `cargo`, `npm`, and other dev tool output before it reaches your LLM.
 
 Together they cover the two sides of a security workflow:
 
@@ -248,6 +248,14 @@ src/
 - Rust 1.75+
 - Burp Suite Pro with the [MCP extension](https://github.com/PortSwigger/mcp-server) installed and running
 - Claude Code
+
+---
+
+## Acknowledgments
+
+BTK exists because of **[RTK (Real Token Killer)](https://github.com/reachingforthejack/rtk)** by [@reachingforthejack](https://github.com/reachingforthejack).
+
+Seeing RTK compress dev tool output before it hits the LLM made the solution obvious — the same idea needed to exist for Burp Suite. BTK is that extension.
 
 ---
 
