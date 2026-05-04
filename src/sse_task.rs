@@ -406,6 +406,198 @@ mod tests {
         assert!(v.pointer("/result/items").is_none(), "result.items must not appear after re-wrap");
     }
 
+    // Helper: run a raw HTTP response through the full pipeline as send_http1_request would.
+    fn run_through_pipeline(raw_http: &str, tool_id: u64) -> String {
+        let config = default_config();
+        let compressor_config = CompressorConfig::default();
+        let cache = default_cache();
+        let inflight: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+        inflight.insert(tool_id, "send_http1_request".to_string());
+        let (session_tx, _) = tokio::sync::watch::channel(None);
+        let ctx = make_ctx(&config, &compressor_config, &cache, &inflight, &session_tx);
+        let escaped = raw_http
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace("\r\n", "\\r\\n");
+        let data = format!(
+            r#"{{"id":{tool_id},"jsonrpc":"2.0","result":{{"content":[{{"type":"text","text":"{escaped}"}}],"isError":false}}}}"#
+        );
+        let result = transform_message_data(&data, &ctx);
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        v.pointer("/result/content/0/text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[test]
+    fn original_bug_oauth_json_login_tokens_intact() {
+        // Reproduces the original bug: BTK was truncating access_token to 100 chars,
+        // making the token cryptographically invalid. Agent fell back to curl.
+        // Real JWT structure: header.payload.signature (each segment base64url, no spaces)
+        let access_token =
+            "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjEifQ\
+             .eyJzdWIiOiJ1c2VyXzEyMyIsImF1ZCI6ImFwaS5leGFtcGxlLmNvbSIsImlzcyI6\
+             Imh0dHBzOi8vYXV0aC5leGFtcGxlLmNvbSIsImlhdCI6MTcwMDAwMDAwMCwiZXhwIj\
+             oxNzAwMDAzNjAwLCJzY29wZSI6InJlYWQgd3JpdGUifQ\
+             .SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5cXXXXXXXXXXXXXXXXXXXX";
+        let refresh_token =
+            "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjIifQ\
+             .eyJzdWIiOiJ1c2VyXzEyMyIsInR5cGUiOiJyZWZyZXNoIiwiaWF0IjoxNzAwMDAw\
+             MDAwLCJleHAiOjE3MDg2NDAwMDB9\
+             .refresh_sig_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+
+        let body = format!(
+            r#"{{"access_token":"{access_token}","refresh_token":"{refresh_token}","token_type":"Bearer","expires_in":3600,"scope":"read write"}}"#
+        );
+        let raw = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{body}");
+        let text = run_through_pipeline(&raw, 1);
+
+        assert!(text.contains(access_token),
+            "access_token must arrive intact — original bug: token truncated to 100 chars\ngot: {text}");
+        assert!(text.contains(refresh_token),
+            "refresh_token must arrive intact\ngot: {text}");
+    }
+
+    #[test]
+    fn original_bug_oauth_form_encoded_tokens_intact() {
+        // OAuth 1.x / some providers return tokens as form-encoded
+        let access_token =
+            "ya29.a0AfH6SMBxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let refresh_token =
+            "1//0gxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+
+        let body = format!(
+            "access_token={access_token}&refresh_token={refresh_token}&token_type=Bearer&expires_in=3600"
+        );
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\n{body}"
+        );
+        let text = run_through_pipeline(&raw, 2);
+
+        assert!(text.contains(access_token),
+            "form-encoded access_token must arrive intact\ngot: {text}");
+        assert!(text.contains(refresh_token),
+            "form-encoded refresh_token must arrive intact\ngot: {text}");
+    }
+
+    #[test]
+    fn original_bug_set_cookie_session_token_intact() {
+        // Session token in Set-Cookie header — agent needs full value for session hijacking tests
+        let session_id = "a3f8b9c2d1e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0";
+
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: session={session_id}; HttpOnly; Secure; Path=/\r\n\r\nOK"
+        );
+        let text = run_through_pipeline(&raw, 3);
+
+        assert!(text.contains(session_id),
+            "session cookie value must arrive intact — agent needs it for session hijacking tests\ngot: {text}");
+    }
+
+    #[test]
+    fn original_bug_aws_credentials_xml_intact() {
+        // AWS STS AssumeRole returns credentials in XML
+        let access_key = "ASIAIOSFODNN7EXAMPLE";
+        let secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYzEXAMPLEKEY";
+        let session_token = "AQoXnyc4lcK4EXAMPLE/ILvM4/aQeRHlqnMFAkEXAMPLEKEYxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+
+        let body = format!(
+            "<?xml version=\"1.0\"?>\
+            <AssumeRoleResponse>\
+              <AssumeRoleResult><Credentials>\
+                <AccessKeyId>{access_key}</AccessKeyId>\
+                <SecretAccessKey>{secret_key}</SecretAccessKey>\
+                <SessionToken>{session_token}</SessionToken>\
+                <Expiration>2024-01-01T00:00:00Z</Expiration>\
+              </Credentials></AssumeRoleResult>\
+            </AssumeRoleResponse>"
+        );
+        let raw = format!("HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\n\r\n{body}");
+        let text = run_through_pipeline(&raw, 4);
+
+        assert!(text.contains(access_key),   "AWS AccessKeyId must be intact\ngot: {text}");
+        assert!(text.contains(secret_key),   "AWS SecretAccessKey must be intact\ngot: {text}");
+        assert!(text.contains(session_token),"AWS SessionToken must be intact\ngot: {text}");
+    }
+
+    #[test]
+    fn original_bug_generic_field_name_token_intact() {
+        // API returning token under generic field name 'data' — previously truncated to 100 chars
+        let api_key = "sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+
+        let body = format!(r#"{{"data":"{api_key}","status":"ok"}}"#);
+        let raw = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{body}");
+        let text = run_through_pipeline(&raw, 5);
+
+        assert!(text.contains(api_key),
+            "token in generic 'data' field must arrive intact\ngot: {text}");
+    }
+
+    #[test]
+    fn pipeline_preserves_credential_fields_in_json_response() {
+        // Regression test: full pipeline (normalize → lossless → body_truncate → re-wrap)
+        // must deliver credential fields intact to the agent.
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.".to_string() + &"a".repeat(200);
+        let prose = "word ".repeat(40);
+        let json_body = format!(
+            r#"{{"access_token":"{jwt}","token_type":"Bearer","description":"{prose}"}}"#,
+        );
+        let raw_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{json_body}"
+        );
+
+        let config = default_config();
+        let compressor_config = CompressorConfig::default();
+        let cache = default_cache();
+        let inflight: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+        inflight.insert(9, "send_http1_request".to_string());
+        let (session_tx, _) = tokio::sync::watch::channel(None);
+        let ctx = make_ctx(&config, &compressor_config, &cache, &inflight, &session_tx);
+
+        let data = format!(
+            r#"{{"id":9,"jsonrpc":"2.0","result":{{"content":[{{"type":"text","text":"{escaped}"}}],"isError":false}}}}"#,
+            escaped = raw_response.replace('\\', "\\\\").replace('"', "\\\"").replace("\r\n", "\\r\\n")
+        );
+        let result = transform_message_data(&data, &ctx);
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let text = v.pointer("/result/content/0/text").and_then(|t| t.as_str())
+            .expect("content[0].text must be present");
+        assert!(text.contains(&jwt),
+            "full pipeline must deliver access_token intact — if this fails, body_truncate is not running correctly through sse_task");
+        assert!(!text.contains(&prose),
+            "non-credential description must be truncated through pipeline");
+    }
+
+    #[test]
+    fn pipeline_http2_preserves_credential_fields() {
+        // send_http2_request goes through the same normalization path — verify credential
+        // protection works end-to-end for HTTP/2 responses too.
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.".to_string() + &"a".repeat(200);
+        let json_body = format!(r#"{{"access_token":"{jwt}","token_type":"Bearer"}}"#);
+        let raw_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{json_body}"
+        );
+
+        let config = default_config();
+        let compressor_config = CompressorConfig::default();
+        let cache = default_cache();
+        let inflight: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+        inflight.insert(10, "send_http2_request".to_string());
+        let (session_tx, _) = tokio::sync::watch::channel(None);
+        let ctx = make_ctx(&config, &compressor_config, &cache, &inflight, &session_tx);
+
+        let data = format!(
+            r#"{{"id":10,"jsonrpc":"2.0","result":{{"content":[{{"type":"text","text":"{escaped}"}}],"isError":false}}}}"#,
+            escaped = raw_response.replace('\\', "\\\\").replace('"', "\\\"").replace("\r\n", "\\r\\n")
+        );
+        let result = transform_message_data(&data, &ctx);
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let text = v.pointer("/result/content/0/text").and_then(|t| t.as_str())
+            .expect("content[0].text must be present for HTTP/2");
+        assert!(text.contains(&jwt), "HTTP/2 pipeline must deliver access_token intact");
+    }
+
     #[test]
     fn inflight_tool_name_is_consumed_on_response() {
         let config = default_config();

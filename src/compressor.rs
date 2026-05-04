@@ -83,10 +83,7 @@ pub fn transform(value: &mut serde_json::Value, config: &CompressorConfig) {
     }
 
     // Write back
-    if let Some(tools_slot) = value
-        .get_mut("result")
-        .and_then(|r| r.get_mut("tools"))
-    {
+    if let Some(tools_slot) = value.get_mut("result").and_then(|r| r.get_mut("tools")) {
         *tools_slot = serde_json::Value::Array(new_tools);
     }
 
@@ -130,8 +127,14 @@ mod tests {
         ]);
         transform(&mut value, &CompressorConfig::default());
         let tools = value["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools[0]["description"].as_str().unwrap(), "Send HTTP/1.1 request, return response.");
-        assert_eq!(tools[1]["description"].as_str().unwrap(), "URL-encode a string.");
+        assert_eq!(
+            tools[0]["description"].as_str().unwrap(),
+            "Send HTTP/1.1 request, return response."
+        );
+        assert_eq!(
+            tools[1]["description"].as_str().unwrap(),
+            "URL-encode a string."
+        );
     }
 
     #[test]
@@ -153,15 +156,22 @@ mod tests {
 
     #[test]
     fn test_override_wins() {
-        let mut value = make_tools_list(vec![
-            make_tool("send_http1_request", "original"),
-        ]);
+        let mut value = make_tools_list(vec![make_tool("send_http1_request", "original")]);
         let mut overrides = std::collections::HashMap::new();
-        overrides.insert("send_http1_request".to_string(), "My custom description".to_string());
-        let config = CompressorConfig { allow: vec![], overrides };
+        overrides.insert(
+            "send_http1_request".to_string(),
+            "My custom description".to_string(),
+        );
+        let config = CompressorConfig {
+            allow: vec![],
+            overrides,
+        };
         transform(&mut value, &config);
         let tools = value["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools[0]["description"].as_str().unwrap(), "My custom description");
+        assert_eq!(
+            tools[0]["description"].as_str().unwrap(),
+            "My custom description"
+        );
     }
 
     #[test]

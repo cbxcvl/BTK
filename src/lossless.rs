@@ -38,6 +38,13 @@ fn strip_headers_in(item: &mut serde_json::Value, side: &str) {
     }
 }
 
+fn is_known_session_cookie(name: &str) -> bool {
+    matches!(name.to_lowercase().as_str(),
+        "phpsessid" | "jsessionid" | "asp.net_sessionid" | "cfid" | "cftoken"
+        | "connect.sid" | "rack.session" | "ci_session" | "laravel_session"
+    )
+}
+
 fn collapse_cookies(item: &mut serde_json::Value, side: &str, header_name: &str) {
     let headers = match item[side]["headers"].as_array_mut() {
         Some(h) => h,
@@ -58,14 +65,20 @@ fn collapse_cookies(item: &mut serde_json::Value, side: &str, header_name: &str)
             let count = cookies.len();
             let session = cookies.iter().find(|c| {
                 let name = c.split('=').next().unwrap_or("").to_lowercase();
-                name.contains("session") || name.contains("sess")
-                    || name.contains("auth") || name.contains("token")
+                is_known_session_cookie(&name)
+                    || crate::body_truncate::is_credential_key(&name)
             });
             let collapsed = match session {
                 Some(s) => {
                     let (cname, cval) = s.split_once('=').unwrap_or((s, ""));
-                    let short_val: String = cval.chars().take(8).collect();
-                    format!("[{count} cookies, {cname}={short_val}...]")
+                    if crate::body_truncate::is_credential_key(cname)
+                        || is_known_session_cookie(cname)
+                    {
+                        format!("[{count} cookies, {cname}={cval}]")
+                    } else {
+                        let short_val: String = cval.chars().take(8).collect();
+                        format!("[{count} cookies, {cname}={short_val}...]")
+                    }
                 }
                 None => format!("[{count} cookies]"),
             };
@@ -117,8 +130,8 @@ mod tests {
         let cookie = req_headers.iter().find(|h| h["name"] == "Cookie").unwrap();
         let val = cookie["value"].as_str().unwrap();
         assert!(val.contains("[4 cookies"), "expected count: got {val}");
-        // First 8 chars of cookie value "abc123def456" = "abc123de"
-        assert!(val.contains("session=abc123de"), "expected 8-char value: got {val}");
+        // session is a credential key (contains "sess") → full value preserved
+        assert!(val.contains("session=abc123def456"), "full session value must be preserved: got {val}");
     }
 
     #[test]
@@ -132,6 +145,107 @@ mod tests {
         let cookie = req_headers.iter().find(|h| h["name"] == "Cookie").unwrap();
         let val = cookie["value"].as_str().unwrap();
         assert_eq!(val, "[2 cookies]");
+    }
+
+    #[test]
+    fn credential_cookie_value_preserved_in_full() {
+        let long_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.".to_string() + &"a".repeat(200);
+        let mut item = make_item(json!([]));
+        item["request"]["headers"] = json!([
+            {"name": "Cookie", "value": format!("auth_token={long_jwt}; _ga=GA1")},
+        ]);
+        strip_item(&mut item);
+        let req_headers = item["request"]["headers"].as_array().unwrap();
+        let cookie = req_headers.iter().find(|h| h["name"] == "Cookie").unwrap();
+        let val = cookie["value"].as_str().unwrap();
+        assert!(val.contains(&long_jwt), "auth_token JWT must not be truncated: {val}");
+    }
+
+    #[test]
+    fn set_cookie_credential_value_preserved_in_full() {
+        let long_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.".to_string() + &"a".repeat(200);
+        let mut item = make_item(json!([
+            {"name": "Set-Cookie", "value": format!("access_token={long_jwt}; HttpOnly; Secure")},
+        ]));
+        strip_item(&mut item);
+        let resp_headers = item["response"]["headers"].as_array().unwrap();
+        let cookie = resp_headers.iter().find(|h| h["name"] == "Set-Cookie").unwrap();
+        let val = cookie["value"].as_str().unwrap();
+        assert!(val.contains(&long_jwt), "Set-Cookie access_token must not be truncated: {val}");
+    }
+
+    #[test]
+    fn credential_named_cookie_not_caught_by_old_finder_preserved() {
+        // jwt / secret are not "session"/"auth"/"token" — old finder missed them
+        let long_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.".to_string() + &"a".repeat(200);
+        for cookie_name in ["jwt", "secret", "private_key", "signature"] {
+            let mut item = make_item(json!([]));
+            item["request"]["headers"] = json!([
+                {"name": "Cookie", "value": format!("{cookie_name}={long_jwt}; _ga=GA1")},
+            ]);
+            strip_item(&mut item);
+            let req_headers = item["request"]["headers"].as_array().unwrap();
+            let cookie = req_headers.iter().find(|h| h["name"] == "Cookie").unwrap();
+            let val = cookie["value"].as_str().unwrap();
+            assert!(
+                val.contains(&long_jwt),
+                "cookie '{cookie_name}' full value must be preserved: {val}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_credential_cookie_still_collapsed() {
+        let mut item = make_item(json!([]));
+        item["request"]["headers"] = json!([
+            {"name": "Cookie", "value": "_ga=GA1; _gid=GA2; _fbp=FB1"},
+        ]);
+        strip_item(&mut item);
+        let req_headers = item["request"]["headers"].as_array().unwrap();
+        let cookie = req_headers.iter().find(|h| h["name"] == "Cookie").unwrap();
+        let val = cookie["value"].as_str().unwrap();
+        // tracker cookies only → no credential name found → collapsed to count only
+        assert_eq!(val, "[3 cookies]", "tracker-only cookies must collapse to count: got {val}");
+    }
+
+    #[test]
+    fn auth_response_headers_pass_through_intact() {
+        let long_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.".to_string() + &"a".repeat(200);
+        for header_name in ["Authorization", "X-Auth-Token", "X-Token", "X-API-Key", "X-Access-Token"] {
+            let mut item = make_item(json!([
+                {"name": "Content-Type",  "value": "application/json"},
+                {"name": header_name,     "value": format!("Bearer {long_jwt}")},
+            ]));
+            strip_item(&mut item);
+            let resp_headers = item["response"]["headers"].as_array().unwrap();
+            let header = resp_headers.iter().find(|h| {
+                h["name"].as_str().unwrap_or("").eq_ignore_ascii_case(header_name)
+            }).unwrap_or_else(|| panic!("{header_name} must survive strip_item"));
+            assert_eq!(
+                header["value"].as_str().unwrap(),
+                format!("Bearer {long_jwt}"),
+                "{header_name} value must be preserved intact"
+            );
+        }
+    }
+
+    #[test]
+    fn well_known_session_cookies_full_value_preserved() {
+        let long_sid = "a".repeat(64);
+        for name in ["PHPSESSID", "JSESSIONID", "ASP.NET_SessionId", "connect.sid", "laravel_session"] {
+            let mut item = make_item(json!([]));
+            item["request"]["headers"] = json!([
+                {"name": "Cookie", "value": format!("{name}={long_sid}; _ga=GA1")},
+            ]);
+            strip_item(&mut item);
+            let req_headers = item["request"]["headers"].as_array().unwrap();
+            let cookie = req_headers.iter().find(|h| h["name"] == "Cookie").unwrap();
+            let val = cookie["value"].as_str().unwrap();
+            assert!(
+                val.contains(&long_sid),
+                "well-known session cookie '{name}' must preserve full value: {val}"
+            );
+        }
     }
 
     #[test]
