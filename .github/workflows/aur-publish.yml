@@ -1,0 +1,81 @@
+name: Publish to AUR
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  aur-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract version
+        id: version
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          echo "pkgver=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download Linux binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ github.event.release.tag_name }}" \
+            --pattern "btk-linux-x86_64" \
+            --pattern "btk-linux-aarch64" \
+            --repo "${{ github.repository }}"
+
+      - name: Compute checksums
+        id: checksums
+        run: |
+          echo "x86_64=$(sha256sum btk-linux-x86_64 | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "aarch64=$(sha256sum btk-linux-aarch64 | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Setup SSH for AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur_key
+          chmod 600 ~/.ssh/aur_key
+          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts
+          printf 'Host aur.archlinux.org\n  IdentityFile ~/.ssh/aur_key\n  User aur\n' >> ~/.ssh/config
+
+      - name: Clone AUR repo
+        run: git clone ssh://aur@aur.archlinux.org/btk-bin.git
+
+      - name: Update PKGBUILD
+        env:
+          PKGVER: ${{ steps.version.outputs.pkgver }}
+          SHA256_X86_64: ${{ steps.checksums.outputs.x86_64 }}
+          SHA256_AARCH64: ${{ steps.checksums.outputs.aarch64 }}
+        run: |
+          cd btk-bin
+          sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('${SHA256_X86_64}')/" PKGBUILD
+          sed -i "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('${SHA256_AARCH64}')/" PKGBUILD
+
+      - name: Update .SRCINFO
+        env:
+          PKGVER: ${{ steps.version.outputs.pkgver }}
+          SHA256_X86_64: ${{ steps.checksums.outputs.x86_64 }}
+          SHA256_AARCH64: ${{ steps.checksums.outputs.aarch64 }}
+          REPO: ${{ github.repository }}
+        run: |
+          cd btk-bin
+          BASE_URL="https://github.com/${REPO}/releases/download/v${PKGVER}"
+          sed -i "s/^\tpkgver = .*/\tpkgver = ${PKGVER}/" .SRCINFO
+          sed -i "s|^\tsource_x86_64 = .*|\tsource_x86_64 = btk-linux-x86_64::${BASE_URL}/btk-linux-x86_64|" .SRCINFO
+          sed -i "s/^\tsha256sums_x86_64 = .*/\tsha256sums_x86_64 = ${SHA256_X86_64}/" .SRCINFO
+          sed -i "s|^\tsource_aarch64 = .*|\tsource_aarch64 = btk-linux-aarch64::${BASE_URL}/btk-linux-aarch64|" .SRCINFO
+          sed -i "s/^\tsha256sums_aarch64 = .*/\tsha256sums_aarch64 = ${SHA256_AARCH64}/" .SRCINFO
+
+      - name: Commit and push to AUR
+        env:
+          PKGVER: ${{ steps.version.outputs.pkgver }}
+        run: |
+          cd btk-bin
+          git config user.name "cbxcvl"
+          git config user.email "carloscavallinburatto@gmail.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "upgrade to ${PKGVER}"
+          git push origin master
