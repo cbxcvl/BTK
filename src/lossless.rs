@@ -63,25 +63,20 @@ fn collapse_cookies(item: &mut serde_json::Value, side: &str, header_name: &str)
                 val.split(';').map(|c| c.trim()).filter(|c| !c.is_empty()).collect()
             };
             let count = cookies.len();
-            let session = cookies.iter().find(|c| {
+            let (creds, others): (Vec<&&str>, Vec<&&str>) = cookies.iter().partition(|c| {
                 let name = c.split('=').next().unwrap_or("").to_lowercase();
-                is_known_session_cookie(&name)
-                    || crate::body_truncate::is_credential_key(&name)
+                is_known_session_cookie(&name) || crate::body_truncate::is_credential_key(&name)
             });
-            let collapsed = match session {
-                Some(s) => {
-                    let (cname, cval) = s.split_once('=').unwrap_or((s, ""));
-                    if crate::body_truncate::is_credential_key(cname)
-                        || is_known_session_cookie(cname)
-                    {
-                        format!("[{count} cookies, {cname}={cval}]")
-                    } else {
-                        let short_val: String = cval.chars().take(8).collect();
-                        format!("[{count} cookies, {cname}={short_val}...]")
-                    }
-                }
-                None => format!("[{count} cookies]"),
-            };
+            let mut parts: Vec<String> = Vec::new();
+            for s in &creds {
+                let (cname, cval) = s.split_once('=').unwrap_or((s, ""));
+                parts.push(format!("{cname}={cval}"));
+            }
+            for s in &others {
+                let cname = s.split('=').next().unwrap_or(s);
+                parts.push(cname.to_string());
+            }
+            let collapsed = format!("[{count} cookies: {}]", parts.join(", "));
             header["value"] = serde_json::Value::String(collapsed);
         }
     }
@@ -129,9 +124,9 @@ mod tests {
         let req_headers = item["request"]["headers"].as_array().unwrap();
         let cookie = req_headers.iter().find(|h| h["name"] == "Cookie").unwrap();
         let val = cookie["value"].as_str().unwrap();
-        assert!(val.contains("[4 cookies"), "expected count: got {val}");
-        // session is a credential key (contains "sess") → full value preserved
+        assert!(val.starts_with("[4 cookies: "), "expected count: got {val}");
         assert!(val.contains("session=abc123def456"), "full session value must be preserved: got {val}");
+        assert!(val.contains("_ga"), "non-credential names must appear: got {val}");
     }
 
     #[test]
@@ -144,7 +139,7 @@ mod tests {
         let req_headers = item["request"]["headers"].as_array().unwrap();
         let cookie = req_headers.iter().find(|h| h["name"] == "Cookie").unwrap();
         let val = cookie["value"].as_str().unwrap();
-        assert_eq!(val, "[2 cookies]");
+        assert_eq!(val, "[2 cookies: _ga, _gid]");
     }
 
     #[test]
@@ -205,7 +200,7 @@ mod tests {
         let cookie = req_headers.iter().find(|h| h["name"] == "Cookie").unwrap();
         let val = cookie["value"].as_str().unwrap();
         // tracker cookies only → no credential name found → collapsed to count only
-        assert_eq!(val, "[3 cookies]", "tracker-only cookies must collapse to count: got {val}");
+        assert_eq!(val, "[3 cookies: _ga, _gid, _fbp]", "tracker-only cookies must list names: got {val}");
     }
 
     #[test]
