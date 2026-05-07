@@ -38,10 +38,30 @@ fn strip_headers_in(item: &mut serde_json::Value, side: &str) {
     }
 }
 
-fn is_known_session_cookie(name: &str) -> bool {
-    matches!(name.to_lowercase().as_str(),
-        "phpsessid" | "jsessionid" | "asp.net_sessionid" | "cfid" | "cftoken"
-        | "connect.sid" | "rack.session" | "ci_session" | "laravel_session"
+fn is_tracker_cookie(name: &str) -> bool {
+    let n = name.to_lowercase();
+    // prefix wildcards first
+    if n.starts_with("_ga_")           // GA4 property IDs
+        || n.starts_with("_gat_")      // GA rate-limit per-property
+        || n.starts_with("_hjincludedin") // Hotjar sampling variants
+    {
+        return true;
+    }
+    matches!(n.as_str(),
+        // Google Analytics
+        "_ga" | "_gid" | "_gat" |
+        // Facebook Pixel
+        "_fbp" | "_fbc" |
+        // Legacy GA / Urchin
+        "__utma" | "__utmb" | "__utmc" | "__utmz" | "__utmt" |
+        // Bing / Microsoft Ads
+        "_uetsid" | "_uetvid" |
+        // Google Ads conversion
+        "_gcl_au" | "_gcl_aw" | "_gcl_dc" |
+        // Hotjar
+        "_hjid" | "_hjfirstseen" | "_hjtldtest" |
+        // Adobe Analytics
+        "s_cc" | "s_sq" | "s_vi" | "s_fid"
     )
 }
 
@@ -63,19 +83,14 @@ fn collapse_cookies(item: &mut serde_json::Value, side: &str, header_name: &str)
                 val.split(';').map(|c| c.trim()).filter(|c| !c.is_empty()).collect()
             };
             let count = cookies.len();
-            let (creds, others): (Vec<&&str>, Vec<&&str>) = cookies.iter().partition(|c| {
-                let name = c.split('=').next().unwrap_or("").to_lowercase();
-                is_known_session_cookie(&name) || crate::body_truncate::is_credential_key(&name)
-            });
-            let mut parts: Vec<String> = Vec::new();
-            for s in &creds {
-                let (cname, cval) = s.split_once('=').unwrap_or((s, ""));
-                parts.push(format!("{cname}={cval}"));
-            }
-            for s in &others {
-                let cname = s.split('=').next().unwrap_or(s);
-                parts.push(cname.to_string());
-            }
+            let parts: Vec<String> = cookies.iter().map(|c| {
+                let name = c.split('=').next().unwrap_or("").trim();
+                if is_tracker_cookie(name) {
+                    name.to_string()
+                } else {
+                    (*c).to_string()
+                }
+            }).collect();
             let collapsed = format!("[{count} cookies: {}]", parts.join(", "));
             header["value"] = serde_json::Value::String(collapsed);
         }
@@ -171,7 +186,6 @@ mod tests {
 
     #[test]
     fn credential_named_cookie_not_caught_by_old_finder_preserved() {
-        // jwt / secret are not "session"/"auth"/"token" — old finder missed them
         let long_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.".to_string() + &"a".repeat(200);
         for cookie_name in ["jwt", "secret", "private_key", "signature"] {
             let mut item = make_item(json!([]));
@@ -187,6 +201,22 @@ mod tests {
                 "cookie '{cookie_name}' full value must be preserved: {val}"
             );
         }
+    }
+
+    #[test]
+    fn custom_app_cookie_value_preserved() {
+        // Any non-tracker cookie (e.g. __client, cf_clearance, XSRF-TOKEN) shows full value
+        let val = "abc123xyz987";
+        let mut item = make_item(json!([]));
+        item["request"]["headers"] = json!([
+            {"name": "Cookie", "value": format!("__client={val}; _ga=GA1; _gid=GA2")},
+        ]);
+        strip_item(&mut item);
+        let req_headers = item["request"]["headers"].as_array().unwrap();
+        let cookie = req_headers.iter().find(|h| h["name"] == "Cookie").unwrap();
+        let result = cookie["value"].as_str().unwrap();
+        assert!(result.contains(&format!("__client={val}")), "__client full value must appear: {result}");
+        assert!(result.contains("_ga") && !result.contains("GA1"), "tracker value must be hidden: {result}");
     }
 
     #[test]
